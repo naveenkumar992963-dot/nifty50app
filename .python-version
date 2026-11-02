@@ -1,1 +1,411 @@
-3.14
+
+import pandas as pd
+import numpy as np
+
+
+def calculate_indicators(df):
+
+    data = df.copy()
+
+    data["ema9"] = data["close"].ewm(
+        span=9,
+        adjust=False
+    ).mean()
+
+    data["ema21"] = data["close"].ewm(
+        span=21,
+        adjust=False
+    ).mean()
+
+    data["ema50"] = data["close"].ewm(
+        span=50,
+        adjust=False
+    ).mean()
+
+    delta = data["close"].diff()
+
+    gain = delta.clip(
+        lower=0
+    ).ewm(
+        alpha=1/14,
+        adjust=False
+    ).mean()
+
+    loss = (-delta.clip(
+        upper=0
+    )).ewm(
+        alpha=1/14,
+        adjust=False
+    ).mean()
+
+    rs = gain / loss.replace(0, np.nan)
+
+    data["rsi"] = 100 - (
+        100 / (1 + rs)
+    )
+
+    true_range = pd.concat(
+        [
+            data["high"] - data["low"],
+            (data["high"] - data["close"].shift()).abs(),
+            (data["low"] - data["close"].shift()).abs()
+        ],
+        axis=1
+    ).max(axis=1)
+
+    data["atr"] = true_range.ewm(
+        alpha=1/14,
+        adjust=False
+    ).mean()
+
+    data["vol_sma"] = data["volume"].rolling(
+        20
+    ).mean()
+
+    typical_price = (
+        data["high"] +
+        data["low"] +
+        data["close"]
+    ) / 3
+
+    data["vwap"] = (
+        typical_price * data["volume"]
+    ).rolling(30).sum() / (
+        data["volume"].rolling(30).sum().replace(0, np.nan)
+    )
+
+    return data
+
+
+def extract_option_chain(chain):
+
+    rows = []
+
+    for item in chain:
+
+        strike = item.get("strike_price")
+
+        for side, field in [
+            ("CE", "call_options"),
+            ("PE", "put_options")
+        ]:
+
+            option = item.get(field) or {}
+
+            market = option.get(
+                "market_data"
+            ) or {}
+
+            greeks = option.get(
+                "option_greeks"
+            ) or {}
+
+            if not market:
+                continue
+
+            ltp = market.get("ltp")
+            bid = market.get("bid_price")
+            ask = market.get("ask_price")
+
+            spread = None
+
+            if (
+                ltp is not None
+                and ltp > 0
+                and bid is not None
+                and ask is not None
+            ):
+
+                spread = (
+                    (ask - bid) / ltp
+                ) * 100
+
+            rows.append({
+
+                "strike": strike,
+                "side": side,
+                "ltp": ltp,
+                "bid": bid,
+                "ask": ask,
+                "volume": market.get("volume"),
+                "oi": market.get("oi"),
+                "prev_oi": market.get("prev_oi"),
+                "iv": greeks.get("iv"),
+                "delta": greeks.get("delta"),
+                "theta": greeks.get("theta"),
+                "spread_pct": spread,
+                "instrument_key": option.get(
+                    "instrument_key"
+                ),
+                "lot_size": option.get("lot_size")
+            })
+
+    return rows
+
+
+def build_signal(candles, chain):
+
+    data = calculate_indicators(candles)
+
+    if len(data) < 55:
+
+        return {
+            "signal": "NO TRADE",
+            "score": 0,
+            "regime": "INSUFFICIENT DATA",
+            "summary": "More market data required.",
+            "reasons": [],
+            "indicators": {},
+            "chart": data,
+            "option_rows": []
+        }
+
+    x = data.iloc[-1]
+
+    option_rows = extract_option_chain(
+        chain
+    )
+
+    options = pd.DataFrame(
+        option_rows
+    )
+
+    ce_oi = 0
+    pe_oi = 0
+
+    if not options.empty:
+
+        ce_oi = pd.to_numeric(
+            options.loc[
+                options["side"] == "CE",
+                "oi"
+            ],
+            errors="coerce"
+        ).sum()
+
+        pe_oi = pd.to_numeric(
+            options.loc[
+                options["side"] == "PE",
+                "oi"
+            ],
+            errors="coerce"
+        ).sum()
+
+    pcr = (
+        pe_oi / ce_oi
+        if ce_oi > 0
+        else np.nan
+    )
+
+    bullish = [
+        ("Price above EMA 21", x["close"] > x["ema21"]),
+        ("EMA 9 above EMA 21", x["ema9"] > x["ema21"]),
+        ("EMA 21 above EMA 50", x["ema21"] > x["ema50"]),
+        ("RSI bullish momentum", 52 <= x["rsi"] <= 70),
+        ("Price above VWAP", x["close"] > x["vwap"]),
+        ("Volume confirmation", x["volume"] > x["vol_sma"]),
+        ("Option PCR bullish", np.isfinite(pcr) and pcr >= 1.0)
+    ]
+
+    bearish = [
+        ("Price below EMA 21", x["close"] < x["ema21"]),
+        ("EMA 9 below EMA 21", x["ema9"] < x["ema21"]),
+        ("EMA 21 below EMA 50", x["ema21"] < x["ema50"]),
+        ("RSI bearish momentum", 30 <= x["rsi"] <= 48),
+        ("Price below VWAP", x["close"] < x["vwap"]),
+        ("Volume confirmation", x["volume"] > x["vol_sma"]),
+        ("Option PCR bearish", np.isfinite(pcr) and pcr <= 0.8)
+    ]
+
+    bull_score = sum(
+        bool(condition)
+        for _, condition in bullish
+    )
+
+    bear_score = sum(
+        bool(condition)
+        for _, condition in bearish
+    )
+
+    if bull_score >= 5 and x["rsi"] < 72:
+
+        signal = "BUY CE"
+        score = round(
+            bull_score / 7 * 100
+        )
+        regime = "BULLISH"
+        selected = bullish
+
+    elif bear_score >= 5 and x["rsi"] > 28:
+
+        signal = "BUY PE"
+        score = round(
+            bear_score / 7 * 100
+        )
+        regime = "BEARISH"
+        selected = bearish
+
+    else:
+
+        signal = "NO TRADE"
+        score = round(
+            max(bull_score, bear_score) / 7 * 100
+        )
+        regime = "MIXED / RANGE"
+
+        selected = (
+            bearish
+            if bear_score > bull_score
+            else bullish
+        )
+
+    reasons = [
+        {
+            "text": name,
+            "passed": bool(condition)
+        }
+        for name, condition in selected
+    ]
+
+    indicators = {
+
+        "RSI": round(
+            float(x["rsi"]), 2
+        ) if pd.notna(x["rsi"]) else None,
+
+        "EMA 9": round(
+            float(x["ema9"]), 2
+        ),
+
+        "EMA 21": round(
+            float(x["ema21"]), 2
+        ),
+
+        "EMA 50": round(
+            float(x["ema50"]), 2
+        ),
+
+        "ATR": round(
+            float(x["atr"]), 2
+        ) if pd.notna(x["atr"]) else None,
+
+        "VWAP": round(
+            float(x["vwap"]), 2
+        ) if pd.notna(x["vwap"]) else None,
+
+        "PCR": round(
+            float(pcr), 3
+        ) if np.isfinite(pcr) else None,
+
+        "CE OI": int(ce_oi),
+        "PE OI": int(pe_oi)
+    }
+
+    summaries = {
+
+        "BUY CE":
+        "Bullish confirmations aligned. Verify live price and spread.",
+
+        "BUY PE":
+        "Bearish confirmations aligned. Verify live price and spread.",
+
+        "NO TRADE":
+        "Required confirmations are not aligned. Wait for a better setup."
+    }
+
+    return {
+
+        "signal": signal,
+        "score": score,
+        "regime": regime,
+        "summary": summaries[signal],
+        "reasons": reasons,
+        "indicators": indicators,
+        "chart": data,
+        "option_rows": option_rows
+    }
+
+
+def choose_option(chain, signal, spot):
+
+    if signal not in [
+        "BUY CE",
+        "BUY PE"
+    ]:
+        return None
+
+    side = (
+        "CE"
+        if signal == "BUY CE"
+        else "PE"
+    )
+
+    rows = extract_option_chain(
+        chain
+    )
+
+    candidates = []
+
+    for option in rows:
+
+        if option["side"] != side:
+            continue
+
+        if not option["ltp"] or option["ltp"] <= 0:
+            continue
+
+        if option["strike"] is None:
+            continue
+
+        delta = option["delta"]
+
+        if delta is not None:
+
+            if side == "CE" and not (
+                0.35 <= delta <= 0.75
+            ):
+                continue
+
+            if side == "PE" and not (
+                -0.75 <= delta <= -0.35
+            ):
+                continue
+
+        candidates.append(option)
+
+    if not candidates:
+        return None
+
+    def rank(option):
+
+        volume = float(
+            option["volume"] or 0
+        )
+
+        oi = float(
+            option["oi"] or 0
+        )
+
+        distance = abs(
+            float(option["strike"]) - spot
+        ) / max(spot * 0.001, 1)
+
+        spread = (
+            float(option["spread_pct"])
+            if option["spread_pct"] is not None
+            else 10
+        )
+
+        return (
+            np.log1p(volume)
+            + np.log1p(oi)
+            - distance
+            - 0.2 * spread
+        )
+
+    return sorted(
+        candidates,
+        key=rank,
+        reverse=True
+    )[0]
+
