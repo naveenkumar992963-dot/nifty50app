@@ -1,522 +1,449 @@
 
-import warnings
-warnings.filterwarnings("ignore")
-
-import numpy as np
-import pandas as pd
 import streamlit as st
-import yfinance as yf
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from urllib.parse import quote
 
-st.set_page_config(
-    page_title="NIFTY Options AI Engine",
-    page_icon="📈",
-    layout="wide"
-)
+st.set_page_config(page_title="NIFTY AI Signal Desk", page_icon="📈", layout="wide")
 
-SYMBOLS = {
-    "NIFTY 50": ("^NSEI", 50),
-    "BANK NIFTY": ("^NSEBANK", 100),
-    "FIN NIFTY": ("^CNXFIN", 50),
-    "SENSEX": ("^BSESN", 100)
-}
+BASE = "https://api.upstox.com"
+NIFTY_KEY = "NSE_INDEX|Nifty 50"
 
-TIMEFRAMES = {
-    "5 Minute": ("5m", "5d"),
-    "15 Minute": ("15m", "1mo"),
-    "30 Minute": ("30m", "1mo"),
-    "1 Hour": ("60m", "3mo")
-}
-
-st.title("🚀 NIFTY OPTIONS BUYING AI ENGINE")
-st.caption("Multi-strategy CE / PE analysis | Educational tool")
-
-# ---------------- DATA ----------------
-
-@st.cache_data(ttl=45)
-def get_data(symbol, interval, period):
-    data = yf.download(
-        symbol,
-        interval=interval,
-        period=period,
-        progress=False,
-        auto_adjust=False,
-        threads=False
+def api_get(path, token, params=None):
+    headers = {
+        "Accept": "application/json",
+        "Api-Version": "2.0",
+        "Authorization": f"Bearer {token}"
+    }
+    response = requests.get(
+        BASE + path,
+        headers=headers,
+        params=params,
+        timeout=20
     )
+    response.raise_for_status()
+    result = response.json()
+    if result.get("status") == "error":
+        raise RuntimeError(str(result))
+    return result.get("data", {})
 
-    if data is None or data.empty:
+def candles_to_df(raw):
+    rows = raw.get("candles", [])
+    if not rows:
         return pd.DataFrame()
 
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
+    df = pd.DataFrame(
+        rows,
+        columns=["time", "open", "high", "low", "close", "volume", "oi"]
+    )
+    df["time"] = pd.to_datetime(df["time"])
 
-    required = ["Open", "High", "Low", "Close", "Volume"]
+    for col in ["open", "high", "low", "close", "volume", "oi"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    if not all(x in data.columns for x in required):
-        return pd.DataFrame()
+    return df.sort_values("time").dropna(subset=["close"]).reset_index(drop=True)
 
-    data = data[required].copy()
+def get_intraday(token, key, minutes):
+    path = (
+        f"/v3/historical-candle/intraday/"
+        f"{quote(key, safe='')}/minutes/{minutes}"
+    )
+    return candles_to_df(api_get(path, token))
 
-    for col in required:
-        data[col] = pd.to_numeric(data[col], errors="coerce")
+def get_historical(token, key, minutes, days=45):
+    end = datetime.now().date()
+    start = end - timedelta(days=days)
 
-    return data.dropna(subset=["Open", "High", "Low", "Close"])
-
-
-# ---------------- INDICATORS ----------------
+    path = (
+        f"/v3/historical-candle/{quote(key, safe='')}/minutes/"
+        f"{minutes}/{end.isoformat()}/{start.isoformat()}"
+    )
+    return candles_to_df(api_get(path, token))
 
 def indicators(df):
     d = df.copy()
 
-    c = d["Close"]
-    h = d["High"]
-    l = d["Low"]
-    v = d["Volume"]
+    d["EMA9"] = d.close.ewm(span=9, adjust=False).mean()
+    d["EMA21"] = d.close.ewm(span=21, adjust=False).mean()
+    d["EMA50"] = d.close.ewm(span=50, adjust=False).mean()
 
-    d["EMA9"] = c.ewm(span=9, adjust=False).mean()
-    d["EMA21"] = c.ewm(span=21, adjust=False).mean()
-    d["EMA50"] = c.ewm(span=50, adjust=False).mean()
-
-    delta = c.diff()
-
-    gain = delta.clip(lower=0).ewm(
-        alpha=1/14, adjust=False
-    ).mean()
-
-    loss = (-delta.clip(upper=0)).ewm(
-        alpha=1/14, adjust=False
-    ).mean()
+    delta = d.close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
 
     rs = gain / loss.replace(0, np.nan)
-
-    d["RSI"] = (100 - 100/(1+rs)).fillna(50)
-
-    fast = c.ewm(span=12, adjust=False).mean()
-    slow = c.ewm(span=26, adjust=False).mean()
-
-    d["MACD"] = fast - slow
-    d["MACD_SIGNAL"] = d["MACD"].ewm(
-        span=9, adjust=False
-    ).mean()
-
-    previous = c.shift(1)
+    d["RSI"] = 100 - (100 / (1 + rs))
 
     tr = pd.concat([
-        h-l,
-        (h-previous).abs(),
-        (l-previous).abs()
+        d.high - d.low,
+        (d.high - d.close.shift()).abs(),
+        (d.low - d.close.shift()).abs()
     ], axis=1).max(axis=1)
 
-    d["ATR"] = tr.ewm(
-        alpha=1/14, adjust=False
-    ).mean()
+    d["ATR"] = tr.ewm(alpha=1/14, adjust=False).mean()
 
-    # ADX
+    return d
 
-    up = h.diff()
-    down = -l.diff()
+def get_signal(df):
+    if len(df) < 55:
+        return "NO TRADE", 0, None
 
-    plus_dm = pd.Series(
-        np.where((up > down) & (up > 0), up, 0),
-        index=d.index
-    )
-
-    minus_dm = pd.Series(
-        np.where((down > up) & (down > 0), down, 0),
-        index=d.index
-    )
-
-    atr = d["ATR"].replace(0, np.nan)
-
-    plus_di = 100 * plus_dm.ewm(
-        alpha=1/14, adjust=False
-    ).mean() / atr
-
-    minus_di = 100 * minus_dm.ewm(
-        alpha=1/14, adjust=False
-    ).mean() / atr
-
-    dx = 100 * (plus_di-minus_di).abs() / (
-        plus_di+minus_di
-    ).replace(0, np.nan)
-
-    d["ADX"] = dx.ewm(
-        alpha=1/14, adjust=False
-    ).mean().fillna(0)
-
-    # VWAP
-
-    typical = (h+l+c)/3
-    volume = v.replace(0, np.nan)
-
-    d["VWAP"] = (
-        (typical*volume).groupby(d.index.date).cumsum()
-        / volume.groupby(d.index.date).cumsum()
-    ).fillna(c)
-
-    # Volume confirmation
-
-    d["VOL_AVG"] = v.rolling(20).mean()
-
-    # Previous candle breakout
-
-    d["PREV_HIGH"] = h.shift(1).rolling(5).max()
-    d["PREV_LOW"] = l.shift(1).rolling(5).min()
-
-    return d.replace(
-        [np.inf, -np.inf], np.nan
-    ).dropna()
-
-
-# ---------------- STRATEGY ENGINE ----------------
-
-def analyze(d):
-
+    d = indicators(df)
     x = d.iloc[-1]
     previous = d.iloc[-2]
 
-    bullish = []
-    bearish = []
+    score = 0
 
-    if x["EMA9"] > x["EMA21"]:
-        bullish.append("EMA 9/21 bullish")
-    else:
-        bearish.append("EMA 9/21 bearish")
+    score += 1 if x.close > x.EMA21 else -1
+    score += 1 if x.EMA9 > x.EMA21 else -1
+    score += 1 if x.EMA21 > x.EMA50 else -1
+    score += 1 if x.RSI > 52 else (-1 if x.RSI < 48 else 0)
+    score += 1 if x.close > previous.high else (
+        -1 if x.close < previous.low else 0
+    )
 
-    if x["Close"] > x["EMA50"]:
-        bullish.append("Above EMA 50")
-    else:
-        bearish.append("Below EMA 50")
+    if score >= 3 and x.RSI < 72:
+        return "BUY CE", score, d
 
-    if x["MACD"] > x["MACD_SIGNAL"]:
-        bullish.append("MACD bullish")
-    else:
-        bearish.append("MACD bearish")
+    if score <= -3 and x.RSI > 28:
+        return "BUY PE", score, d
 
-    if x["Close"] > x["VWAP"]:
-        bullish.append("Above VWAP")
-    else:
-        bearish.append("Below VWAP")
+    return "NO TRADE", score, d
 
-    if 50 <= x["RSI"] <= 68:
-        bullish.append("RSI bullish zone")
+def make_option_table(chain):
+    rows = []
 
-    if 32 <= x["RSI"] <= 50:
-        bearish.append("RSI bearish zone")
+    for item in chain:
+        strike = item.get("strike_price")
 
-    if x["ADX"] >= 20:
-        if x["EMA9"] > x["EMA21"]:
-            bullish.append("Strong trend ADX")
-        elif x["EMA9"] < x["EMA21"]:
-            bearish.append("Strong trend ADX")
+        for side, field in [
+            ("CE", "call_options"),
+            ("PE", "put_options")
+        ]:
+            option = item.get(field) or {}
+            market = option.get("market_data") or {}
+            greeks = option.get("option_greeks") or {}
 
-    if (
-        x["Volume"] > x["VOL_AVG"]
-        and x["Close"] > x["Open"]
-    ):
-        bullish.append("Buying volume confirmation")
+            if market:
+                rows.append({
+                    "Strike": strike,
+                    "Side": side,
+                    "LTP": market.get("ltp"),
+                    "Bid": market.get("bid_price"),
+                    "Ask": market.get("ask_price"),
+                    "Volume": market.get("volume"),
+                    "OI": market.get("oi"),
+                    "IV": greeks.get("iv"),
+                    "Delta": greeks.get("delta"),
+                    "Theta": greeks.get("theta"),
+                    "Instrument": option.get("instrument_key")
+                })
 
-    if (
-        x["Volume"] > x["VOL_AVG"]
-        and x["Close"] < x["Open"]
-    ):
-        bearish.append("Selling volume confirmation")
+    return pd.DataFrame(rows)
 
-    if x["Close"] > x["PREV_HIGH"]:
-        bullish.append("Previous high breakout")
+def select_contract(options, side, spot):
+    data = options[options.Side == side].copy()
+    data = data.dropna(subset=["LTP", "Strike"])
 
-    if x["Close"] < x["PREV_LOW"]:
-        bearish.append("Previous low breakdown")
+    if data.empty:
+        return None
 
-    bull_score = len(bullish)
-    bear_score = len(bearish)
+    data["Distance"] = abs(data.Strike - spot)
 
-    if bull_score >= 5 and bull_score >= bear_score + 2:
-        trend = "BULLISH"
-    elif bear_score >= 5 and bear_score >= bull_score + 2:
-        trend = "BEARISH"
-    else:
-        trend = "SIDEWAYS"
+    data["Spread"] = (
+        (data.Ask - data.Bid) / data.LTP * 100
+    ).replace([np.inf, -np.inf], np.nan)
 
-    return {
-        "trend": trend,
-        "bull": bull_score,
-        "bear": bear_score,
-        "price": float(x["Close"]),
-        "rsi": float(x["RSI"]),
-        "adx": float(x["ADX"]),
-        "atr": float(x["ATR"]),
-        "bull_reasons": bullish,
-        "bear_reasons": bearish
-    }
+    data["Volume"] = pd.to_numeric(
+        data.Volume, errors="coerce"
+    ).fillna(0)
 
+    data["OI"] = pd.to_numeric(
+        data.OI, errors="coerce"
+    ).fillna(0)
 
-# ---------------- SIDEBAR ----------------
+    data["Liquidity"] = (
+        np.log1p(data.Volume) + np.log1p(data.OI)
+    )
+
+    data["Score"] = (
+        data.Liquidity
+        - data.Distance / max(spot * 0.001, 1)
+        - data.Spread.fillna(10) * 0.15
+    )
+
+    return data.sort_values(
+        "Score", ascending=False
+    ).iloc[0]
+
+st.title("📈 NIFTY AI Trading Signal Platform")
+st.caption("Upstox Live Option Chain | CE / PE | Risk Management")
 
 with st.sidebar:
+    st.header("Settings")
 
-    st.header("⚙️ SETTINGS")
-
-    index_name = st.selectbox(
-        "Select Index",
-        list(SYMBOLS.keys())
+    token = st.text_input(
+        "Upstox Access Token",
+        type="password"
     )
 
     timeframe = st.selectbox(
-        "Entry Timeframe",
-        list(TIMEFRAMES.keys()),
-        index=1
+        "Timeframe",
+        [1, 3, 5, 15, 30],
+        index=2
+    )
+
+    expiry = st.date_input(
+        "Option Expiry Date",
+        value=datetime.now().date() + timedelta(days=7)
     )
 
     capital = st.number_input(
         "Trading Capital ₹",
         min_value=1000,
-        value=20000,
+        value=25000,
         step=1000
     )
 
-    risk_percent = st.slider(
+    risk = st.slider(
         "Risk per trade %",
-        0.5, 5.0, 1.0, 0.5
+        0.25, 2.0, 0.5, 0.25
     )
 
-    lot_size = st.number_input(
-        "Current Lot Size",
-        min_value=1,
-        value=65
+    refresh = st.button("Refresh Live Data")
+
+if not token:
+    st.info("Live analysis ke liye Upstox Access Token enter karein.")
+
+    st.markdown("""
+    ### Upstox API kaise milegi?
+
+    1. https://account.upstox.com/developer/apps kholo.
+    2. Login karo.
+    3. Create App par click karo.
+    4. API application setup karo.
+    5. Access Token generate karo.
+    6. Token ko sidebar mein paste karo.
+
+    API Secret ya Password kisi ko mat dena.
+    """)
+
+    st.stop()
+
+try:
+    with st.spinner("Upstox se live data aa raha hai..."):
+
+        candles = get_intraday(
+            token,
+            NIFTY_KEY,
+            timeframe
+        )
+
+        if len(candles) < 55:
+            historical = get_historical(
+                token,
+                NIFTY_KEY,
+                timeframe
+            )
+
+            candles = pd.concat(
+                [historical, candles]
+            ).drop_duplicates(
+                "time"
+            ).sort_values(
+                "time"
+            ).reset_index(drop=True)
+
+        chain_data = api_get(
+            "/v2/option/chain",
+            token,
+            {
+                "instrument_key": NIFTY_KEY,
+                "expiry_date": expiry.isoformat()
+            }
+        )
+
+        chain = (
+            chain_data
+            if isinstance(chain_data, list)
+            else chain_data.get("data", [])
+        )
+
+        options = make_option_table(chain)
+
+except Exception as error:
+    st.error("Upstox API connection error")
+    st.code(str(error))
+    st.stop()
+
+if candles.empty or options.empty:
+    st.error("Live candles ya option chain available nahi hai.")
+    st.stop()
+
+spot_values = [
+    item.get("underlying_spot_price")
+    for item in chain
+    if item.get("underlying_spot_price")
+]
+
+spot = (
+    float(spot_values[0])
+    if spot_values
+    else float(candles.close.iloc[-1])
+)
+
+signal, score, chart_data = get_signal(candles)
+
+latest = chart_data.iloc[-1]
+
+ce_oi = pd.to_numeric(
+    options.loc[options.Side == "CE", "OI"],
+    errors="coerce"
+).sum()
+
+pe_oi = pd.to_numeric(
+    options.loc[options.Side == "PE", "OI"],
+    errors="coerce"
+).sum()
+
+pcr = pe_oi / ce_oi if ce_oi else np.nan
+
+bullish_oi = pcr >= 1.0 if np.isfinite(pcr) else False
+bearish_oi = pcr <= 0.8 if np.isfinite(pcr) else False
+
+if signal == "BUY CE" and not bullish_oi:
+    signal = "NO TRADE"
+
+if signal == "BUY PE" and not bearish_oi:
+    signal = "NO TRADE"
+
+st.subheader("Market Overview")
+
+a, b, c, d = st.columns(4)
+
+a.metric("NIFTY Spot", f"₹{spot:,.2f}")
+b.metric("Trend Score", f"{score:+d}/5")
+c.metric("RSI", f"{latest.RSI:.2f}")
+d.metric(
+    "PCR",
+    f"{pcr:.2f}" if np.isfinite(pcr) else "N/A"
+)
+
+st.markdown("---")
+st.subheader("AI Trading Decision")
+
+st.markdown(f"# {signal}")
+
+if signal == "BUY CE":
+    st.success("Bullish setup detected. CE candidate.")
+
+elif signal == "BUY PE":
+    st.error("Bearish setup detected. PE candidate.")
+
+else:
+    st.warning("No qualified setup. Wait for confirmation.")
+
+side = (
+    "CE" if signal == "BUY CE"
+    else "PE" if signal == "BUY PE"
+    else None
+)
+
+if side:
+    contract = select_contract(
+        options,
+        side,
+        spot
     )
 
-symbol, strike_step = SYMBOLS[index_name]
+    if contract is not None:
+        premium = float(contract.LTP)
 
-# ---------------- MULTI TIMEFRAME ----------------
+        sl = premium * 0.80
+        target1 = premium * 1.25
+        target2 = premium * 1.50
 
-st.subheader("🧭 MULTI TIMEFRAME ANALYSIS")
+        risk_amount = capital * risk / 100
+        quantity = int(
+            risk_amount / max(premium - sl, 0.01)
+        )
 
-results = {}
-rows = []
+        st.subheader("Selected Option")
 
-for tf_name, (interval, period) in TIMEFRAMES.items():
+        x1, x2, x3, x4 = st.columns(4)
 
-    raw = get_data(symbol, interval, period)
+        x1.metric(
+            "Strike",
+            f"{int(contract.Strike)} {side}"
+        )
 
-    if raw.empty or len(raw) < 70:
-        rows.append({
-            "Timeframe": tf_name,
-            "Trend": "Insufficient data"
-        })
-        continue
+        x2.metric(
+            "Premium",
+            f"₹{premium:.2f}"
+        )
 
-    calculated = indicators(raw)
+        x3.metric(
+            "Indicative SL",
+            f"₹{sl:.2f}"
+        )
 
-    if len(calculated) < 3:
-        continue
+        x4.metric(
+            "Targets",
+            f"₹{target1:.2f} / ₹{target2:.2f}"
+        )
 
-    result = analyze(calculated)
+        st.write(
+            f"Risk Budget: ₹{risk_amount:.2f}"
+        )
 
-    results[tf_name] = result
+        st.write(
+            f"Theoretical quantity: {quantity} units. "
+            "Actual lot-size rounding and margin must be checked."
+        )
 
-    rows.append({
-        "Timeframe": tf_name,
-        "Trend": result["trend"],
-        "Bull Score": result["bull"],
-        "Bear Score": result["bear"],
-        "RSI": round(result["rsi"], 1),
-        "ADX": round(result["adx"], 1)
-    })
+        if pd.notna(contract.Bid) and pd.notna(contract.Ask):
+            spread = (
+                (contract.Ask - contract.Bid)
+                / premium * 100
+            )
+
+            if spread > 3:
+                st.warning(
+                    "Bid-Ask spread high hai. Contract avoid karne par vichar karein."
+                )
+
+st.subheader("Option Chain")
+
+options["Distance"] = abs(
+    options.Strike - spot
+)
 
 st.dataframe(
-    pd.DataFrame(rows),
+    options.sort_values("Distance").head(30),
     use_container_width=True,
     hide_index=True
 )
 
-if timeframe not in results:
-    st.error("Selected timeframe data unavailable.")
-    st.stop()
-
-main = results[timeframe]
-
-bull_count = sum(
-    1 for x in results.values()
-    if x["trend"] == "BULLISH"
-)
-
-bear_count = sum(
-    1 for x in results.values()
-    if x["trend"] == "BEARISH"
-)
-
-valid_tf_count = len(results)
-
-# ---------------- FINAL SIGNAL ----------------
-
-st.divider()
-st.subheader("🎯 FINAL OPTIONS SIGNAL")
-
-ce_confirmation = (
-    main["trend"] == "BULLISH"
-    and main["rsi"] >= 50
-    and main["rsi"] < 70
-    and main["adx"] >= 20
-    and bull_count >= 3
-)
-
-pe_confirmation = (
-    main["trend"] == "BEARISH"
-    and main["rsi"] <= 50
-    and main["rsi"] > 30
-    and main["adx"] >= 20
-    and bear_count >= 3
-)
-
-if valid_tf_count < 3:
-    signal = "NO TRADE"
-    reason = "Not enough timeframe confirmations."
-
-elif ce_confirmation:
-    signal = "BUY CE"
-    reason = "Bullish multi-timeframe confirmation."
-
-elif pe_confirmation:
-    signal = "BUY PE"
-    reason = "Bearish multi-timeframe confirmation."
-
-else:
-    signal = "NO TRADE"
-    reason = "Strategy conditions are not fully confirmed."
-
-c1, c2, c3, c4 = st.columns(4)
-
-c1.metric("Spot Price", f"{main['price']:,.2f}")
-c2.metric("Market Trend", main["trend"])
-c3.metric("RSI", f"{main['rsi']:.2f}")
-c4.metric("ADX", f"{main['adx']:.2f}")
-
-if signal == "BUY CE":
-    st.success("🟢 BUY CE SETUP")
-elif signal == "BUY PE":
-    st.error("🔴 BUY PE SETUP")
-else:
-    st.warning("🟡 NO TRADE")
-
-st.write(reason)
-
-# ---------------- AUTO STRIKE SELECTION ----------------
-
-st.divider()
-st.subheader("🏆 AUTOMATIC STRIKE SELECTION")
-
-spot = main["price"]
-
-atm = int(round(spot / strike_step) * strike_step)
-
-if signal == "BUY CE":
-    option_type = "CE"
-    selected_strike = atm - strike_step
-elif signal == "BUY PE":
-    option_type = "PE"
-    selected_strike = atm + strike_step
-else:
-    option_type = None
-    selected_strike = atm
-
-if option_type:
-
-    st.success(
-        f"Suggested Contract: {selected_strike} {option_type}"
-    )
-
-    st.write(f"ATM Strike: {atm}")
-    st.write(f"ITM Strike: {selected_strike}")
-
-    st.caption(
-        "Strike is calculated from index spot and standard strike interval. "
-        "Verify the actual listed contract and expiry with your broker."
-    )
-
-else:
-    st.info("No CE/PE contract recommended until confirmation.")
-
-# ---------------- OPTION PREMIUM CALCULATOR ----------------
-
-st.divider()
-st.subheader("💰 OPTION ENTRY / SL / TARGET")
-
-st.info(
-    "Live option chain is not connected. Enter actual premium from broker."
-)
-
-premium = st.number_input(
-    "Selected option premium ₹",
-    min_value=0.0,
-    value=100.0,
-    step=0.5
-)
-
-if premium > 0:
-
-    entry = premium
-    sl = entry * 0.80
-    target1 = entry * 1.30
-    target2 = entry * 1.60
-
-    risk_budget = capital * risk_percent / 100
-
-    risk_per_unit = entry - sl
-
-    quantity = int(risk_budget // risk_per_unit)
-
-    quantity = (
-        quantity // int(lot_size)
-    ) * int(lot_size)
-
-    lots = quantity // int(lot_size)
-
-    a, b, c, d = st.columns(4)
-
-    a.metric("Entry Premium", f"₹{entry:.2f}")
-    b.metric("Stop Loss", f"₹{sl:.2f}")
-    c.metric("Target 1", f"₹{target1:.2f}")
-    d.metric("Target 2", f"₹{target2:.2f}")
-
-    x, y, z = st.columns(3)
-
-    x.metric("Quantity", quantity)
-    y.metric("Lots", lots)
-    z.metric("Capital Required", f"₹{quantity*entry:,.2f}")
-
-    if quantity == 0:
-        st.warning("Risk budget insufficient for one full lot.")
-
-st.caption(
-    "Premium SL/targets are illustrative percentages, not live option technical levels."
-)
-
-# ---------------- CHARTS ----------------
-
-st.divider()
-st.subheader("📊 PRICE CHART")
+st.subheader("Technical Chart")
 
 st.line_chart(
-    indicators(
-        get_data(
-            symbol,
-            TIMEFRAMES[timeframe][0],
-            TIMEFRAMES[timeframe][1]
-        )
-    )[["Close", "EMA9", "EMA21", "EMA50", "VWAP"]].tail(200),
-    use_container_width=True
+    chart_data.set_index("time")[
+        ["close", "EMA9", "EMA21", "EMA50"]
+    ].tail(150)
 )
 
-# ---------------- DISCLAIMER ----------------
+st.subheader("Risk Warning")
 
-st.warning(
-    "Options buying involves substantial risk and may result in "
-    "loss of the entire premium. This tool does not access live option "
-    "chain, Greeks, implied volatility, bid-ask spread or actual execution. "
-    "Signals are not guaranteed. Verify every trade independently."
-)
+st.warning("""
+Ye decision-support system hai, guaranteed-profit AI nahi.
 
-st.caption(
-    "Yahoo Finance data | Multi-indicator strategy | "
-    "No trades are automatically executed."
-)
+- Signal rule-based hai, trained ML model nahi.
+- SL aur targets indicative percentage levels hain.
+- Historical option premium backtesting abhi zaroori hai.
+- Brokerage, slippage, IV aur theta ko dhyan mein rakhein.
+- Pehle paper trading karein.
+- App automatic order execute nahi karta.
+- Access Token ko GitHub par kabhi upload na karein.
+""")
