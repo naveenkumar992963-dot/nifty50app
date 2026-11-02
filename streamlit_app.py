@@ -603,3 +603,434 @@ st.info(
     "Yahoo Finance data may be delayed. This version does not place orders."
             )
         
+# ==========================================================
+# BACKTESTING + STRATEGY ACCURACY TRACKER V2
+# Append this block at the END of streamlit_app.py
+# ==========================================================
+
+st.divider()
+st.title("🧪 STRATEGY BACKTESTING CENTER")
+st.caption("Historical testing | Multiple strategies | Risk analysis")
+
+fee_bps = st.number_input(
+    "Estimated brokerage and other charges (bps per side)",
+    min_value=0.0,
+    max_value=100.0,
+    value=5.0,
+    step=1.0
+)
+
+slippage_bps = st.number_input(
+    "Estimated slippage (bps per side)",
+    min_value=0.0,
+    max_value=100.0,
+    value=2.0,
+    step=1.0
+)
+
+risk_atr = st.number_input(
+    "Stop Loss ATR Multiplier",
+    min_value=0.5,
+    max_value=5.0,
+    value=1.5,
+    step=0.1
+)
+
+reward_ratio = st.number_input(
+    "Target Risk Reward",
+    min_value=1.0,
+    max_value=5.0,
+    value=2.0,
+    step=0.5
+)
+
+max_hold = st.number_input(
+    "Maximum holding candles",
+    min_value=1,
+    max_value=100,
+    value=12
+)
+
+bt_interval = st.selectbox(
+    "Backtesting timeframe",
+    ["5m", "15m", "30m", "60m"]
+)
+
+@st.cache_data(ttl=300)
+def load_backtest_data(interval):
+    return get_data(interval, "60d")
+
+
+def build_strategy_signals(df):
+    x = df.copy()
+
+    close = x["Close"]
+    ema9 = x["EMA9"]
+    ema21 = x["EMA21"]
+
+    # 1. EMA crossover
+    ema_signal = pd.Series(0, index=x.index)
+    ema_signal.loc[
+        (ema9 > ema21) &
+        (ema9.shift(1) <= ema21.shift(1))
+    ] = 1
+    ema_signal.loc[
+        (ema9 < ema21) &
+        (ema9.shift(1) >= ema21.shift(1))
+    ] = -1
+
+    # 2. RSI reversal
+    rsi_signal = pd.Series(0, index=x.index)
+    rsi_signal.loc[
+        (x["RSI"] > 30) &
+        (x["RSI"].shift(1) <= 30)
+    ] = 1
+    rsi_signal.loc[
+        (x["RSI"] < 70) &
+        (x["RSI"].shift(1) >= 70)
+    ] = -1
+
+    # 3. MACD crossover
+    macd_signal = pd.Series(0, index=x.index)
+    macd_signal.loc[
+        (x["MACD"] > x["MACD_SIGNAL"]) &
+        (x["MACD"].shift(1) <= x["MACD_SIGNAL"].shift(1))
+    ] = 1
+    macd_signal.loc[
+        (x["MACD"] < x["MACD_SIGNAL"]) &
+        (x["MACD"].shift(1) >= x["MACD_SIGNAL"].shift(1))
+    ] = -1
+
+    # 4. VWAP crossover
+    vwap_signal = pd.Series(0, index=x.index)
+    vwap_signal.loc[
+        (close > x["VWAP"]) &
+        (close.shift(1) <= x["VWAP"].shift(1))
+    ] = 1
+    vwap_signal.loc[
+        (close < x["VWAP"]) &
+        (close.shift(1) >= x["VWAP"].shift(1))
+    ] = -1
+
+    # 5. Supertrend direction change
+    st_signal = pd.Series(0, index=x.index)
+    st_signal.loc[
+        (x["ST_DIRECTION"] == 1) &
+        (x["ST_DIRECTION"].shift(1) == -1)
+    ] = 1
+    st_signal.loc[
+        (x["ST_DIRECTION"] == -1) &
+        (x["ST_DIRECTION"].shift(1) == 1)
+    ] = -1
+
+    # 6. Combined strategy
+    bull = (
+        (ema9 > ema21).astype(int)
+        + (x["MACD"] > x["MACD_SIGNAL"]).astype(int)
+        + ((x["RSI"] > 50) & (x["RSI"] < 75)).astype(int)
+        + (close > x["VWAP"]).astype(int)
+        + (x["ST_DIRECTION"] == 1).astype(int)
+    )
+
+    bear = (
+        (ema9 < ema21).astype(int)
+        + (x["MACD"] < x["MACD_SIGNAL"]).astype(int)
+        + ((x["RSI"] < 50) & (x["RSI"] > 25)).astype(int)
+        + (close < x["VWAP"]).astype(int)
+        + (x["ST_DIRECTION"] == -1).astype(int)
+    )
+
+    combined_signal = pd.Series(0, index=x.index)
+    combined_signal.loc[(bull >= 4) & (bull > bear)] = 1
+    combined_signal.loc[(bear >= 4) & (bear > bull)] = -1
+
+    return {
+        "EMA Crossover": ema_signal,
+        "RSI Reversal": rsi_signal,
+        "MACD Momentum": macd_signal,
+        "VWAP Crossover": vwap_signal,
+        "Supertrend": st_signal,
+        "Combined Strategy": combined_signal
+    }
+
+
+def run_backtest(
+    df,
+    signals,
+    sl_multiplier,
+    rr,
+    holding,
+    fee,
+    slip
+):
+    trades = []
+    position = None
+
+    # Signals use completed candle i-1.
+    # Entry occurs at next candle open i.
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        previous_signal = int(signals.iloc[i-1])
+
+        if position is None:
+            if previous_signal == 0:
+                continue
+
+            entry = float(row["Open"])
+            atr = float(df["ATR"].iloc[i-1])
+
+            if not np.isfinite(entry) or not np.isfinite(atr):
+                continue
+
+            if entry <= 0 or atr <= 0:
+                continue
+
+            direction = previous_signal
+            distance = sl_multiplier * atr
+
+            position = {
+                "direction": direction,
+                "entry": entry,
+                "sl": entry - direction * distance,
+                "target": entry + direction * distance * rr,
+                "entry_index": i,
+                "entry_time": df.index[i]
+            }
+            continue
+
+        direction = position["direction"]
+        stop_hit = (
+            float(row["Low"]) <= position["sl"]
+            if direction == 1
+            else float(row["High"]) >= position["sl"]
+        )
+
+        target_hit = (
+            float(row["High"]) >= position["target"]
+            if direction == 1
+            else float(row["Low"]) <= position["target"]
+        )
+
+        exit_price = None
+        exit_reason = None
+
+        # Conservative assumption:
+        # if SL and target hit in same candle, count SL first.
+        if stop_hit:
+            exit_price = position["sl"]
+            exit_reason = "Stop Loss"
+        elif target_hit:
+            exit_price = position["target"]
+            exit_reason = "Target"
+        elif i - position["entry_index"] >= holding:
+            exit_price = float(row["Close"])
+            exit_reason = "Time Exit"
+
+        if exit_price is not None:
+            entry = position["entry"]
+            gross_return = (
+                direction * (exit_price - entry) / entry
+            )
+
+            total_cost = 2 * (fee + slip) / 10000
+            net_return = gross_return - total_cost
+
+            trades.append({
+                "Entry Time": position["entry_time"],
+                "Exit Time": df.index[i],
+                "Direction": "LONG" if direction == 1 else "SHORT",
+                "Entry": entry,
+                "Exit": exit_price,
+                "Gross Return %": gross_return * 100,
+                "Net Return %": net_return * 100,
+                "Exit Reason": exit_reason,
+                "Result": "WIN" if net_return > 0 else "LOSS"
+            })
+
+            position = None
+
+    # Close any open position at final available candle.
+    if position is not None:
+        last = df.iloc[-1]
+        exit_price = float(last["Close"])
+        entry = position["entry"]
+        direction = position["direction"]
+
+        gross_return = direction * (exit_price - entry) / entry
+        total_cost = 2 * (fee + slip) / 10000
+        net_return = gross_return - total_cost
+
+        trades.append({
+            "Entry Time": position["entry_time"],
+            "Exit Time": df.index[-1],
+            "Direction": "LONG" if direction == 1 else "SHORT",
+            "Entry": entry,
+            "Exit": exit_price,
+            "Gross Return %": gross_return * 100,
+            "Net Return %": net_return * 100,
+            "Exit Reason": "End of Data",
+            "Result": "WIN" if net_return > 0 else "LOSS"
+        })
+
+    if not trades:
+        return None
+
+    trade_df = pd.DataFrame(trades)
+
+    net = trade_df["Net Return %"]
+    wins = net[net > 0]
+    losses = net[net <= 0]
+
+    equity = (1 + net / 100).cumprod()
+    peak = equity.cummax()
+    drawdown = (equity / peak - 1) * 100
+
+    gross_profit = wins.sum()
+    gross_loss = abs(losses.sum())
+
+    profit_factor = (
+        gross_profit / gross_loss
+        if gross_loss > 0 else np.inf
+    )
+
+    return {
+        "trades": trade_df,
+        "count": len(trade_df),
+        "win_rate": (net > 0).mean() * 100,
+        "net_return": (equity.iloc[-1] - 1) * 100,
+        "profit_factor": profit_factor,
+        "max_drawdown": abs(drawdown.min()),
+        "wins": int((net > 0).sum()),
+        "losses": int((net <= 0).sum())
+    }
+
+
+if st.button("🚀 RUN STRATEGY BACKTEST", type="primary"):
+    with st.spinner("Downloading historical data and testing strategies..."):
+
+        raw_bt = load_backtest_data(bt_interval)
+
+        if raw_bt.empty:
+            st.error("Historical data unavailable.")
+        else:
+            bt_df = add_indicators(raw_bt).dropna().copy()
+
+            if len(bt_df) < 100:
+                st.error("Insufficient historical candles.")
+            else:
+                strategy_signals = build_strategy_signals(bt_df)
+
+                reports = {}
+
+                for name, signal_series in strategy_signals.items():
+                    report = run_backtest(
+                        bt_df,
+                        signal_series,
+                        risk_atr,
+                        reward_ratio,
+                        int(max_hold),
+                        fee_bps,
+                        slippage_bps
+                    )
+
+                    if report is not None:
+                        reports[name] = report
+
+                if not reports:
+                    st.warning(
+                        "No completed trades found. "
+                        "Try another timeframe or more data."
+                    )
+                else:
+                    summary = []
+
+                    for name, report in reports.items():
+                        pf = report["profit_factor"]
+
+                        summary.append({
+                            "Strategy": name,
+                            "Trades": report["count"],
+                            "Win Rate %": round(report["win_rate"], 2),
+                            "Net Return %": round(report["net_return"], 2),
+                            "Profit Factor": (
+                                round(pf, 2)
+                                if np.isfinite(pf) else "∞"
+                            ),
+                            "Max Drawdown %": round(
+                                report["max_drawdown"], 2
+                            )
+                        })
+
+                    table = pd.DataFrame(summary)
+
+                    st.subheader("🏆 Strategy Performance Ranking")
+
+                    st.dataframe(
+                        table.sort_values(
+                            "Net Return %",
+                            ascending=False
+                        ),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    st.subheader("📊 Strategy Comparison")
+
+                    st.bar_chart(
+                        table.set_index("Strategy")[
+                            ["Win Rate %", "Net Return %"]
+                        ]
+                    )
+
+                    best_name = max(
+                        reports,
+                        key=lambda n: reports[n]["net_return"]
+                    )
+
+                    best = reports[best_name]
+
+                    st.success(
+                        f"Highest historical net return: {best_name}"
+                    )
+
+                    a, b, c, d = st.columns(4)
+
+                    a.metric("Total Trades", best["count"])
+                    b.metric("Win Rate", f'{best["win_rate"]:.2f}%')
+                    c.metric(
+                        "Profit Factor",
+                        (
+                            f'{best["profit_factor"]:.2f}'
+                            if np.isfinite(best["profit_factor"])
+                            else "∞"
+                        )
+                    )
+                    d.metric(
+                        "Max Drawdown",
+                        f'{best["max_drawdown"]:.2f}%'
+                    )
+
+                    st.subheader("📜 Best Strategy Trade History")
+
+                    st.dataframe(
+                        best["trades"].tail(100),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    csv = best["trades"].to_csv(index=False)
+
+                    st.download_button(
+                        "⬇️ Download Trade History CSV",
+                        csv,
+                        file_name="nifty_backtest_trades.csv",
+                        mime="text/csv"
+                    )
+
+                    st.info(
+                        "Important: this is a historical spot-price simulation, "
+                        "not live option trading. The best strategy is selected "
+                        "on the same sample being tested, so it is not proof of "
+                        "future performance. Test it on unseen data before use."
+            )
+                    
