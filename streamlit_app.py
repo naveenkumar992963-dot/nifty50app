@@ -915,6 +915,15 @@ if st.button("🚀 RUN STRATEGY BACKTEST", type="primary"):
         else:
             bt_df = add_indicators(raw_bt).dropna().copy()
 
+st.write("Available candles:", len(bt_df))
+
+if len(bt_df) < 100:
+    st.warning(
+        f"Only {len(bt_df)} valid candles available. "
+        "At least 100 are required."
+    )
+    st.stop()
+
             if len(bt_df) < 100:
                 st.error("Insufficient historical candles.")
             else:
