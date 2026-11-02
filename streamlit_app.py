@@ -5,17 +5,17 @@ import pandas as pd
 import numpy as np
 
 st.set_page_config(
-    page_title="NIFTY 50 Trading Signals",
+    page_title="NIFTY 50 Advanced Dashboard",
     page_icon="📈",
     layout="wide"
 )
 
-st.title("📈 NIFTY 50 TRADING SIGNALS")
-st.caption("Technical analysis dashboard | 5-minute timeframe")
+st.title("📈 NIFTY 50 ADVANCED TRADING DASHBOARD")
+st.caption("5-minute technical analysis | Paper trading only")
 
 st.warning(
-    "Educational tool only. Signals are not guaranteed. "
-    "Verify market data and risk before trading."
+    "Educational tool. Signals are not guaranteed. "
+    "Verify data and option prices before trading."
 )
 
 @st.cache_data(ttl=60)
@@ -28,11 +28,11 @@ def get_data():
         auto_adjust=False
     )
 
+    if df.empty:
+        return df
+
     if isinstance(df.columns, pd.MultiIndex):
-        if "Close" in df.columns.get_level_values(0):
-            df.columns = df.columns.get_level_values(0)
-        else:
-            df.columns = df.columns.get_level_values(1)
+        df.columns = df.columns.get_level_values(0)
 
     return df.dropna()
 
@@ -42,8 +42,8 @@ if st.button("🔄 Refresh Market Data"):
 try:
     df = get_data()
 
-    if df.empty or len(df) < 30:
-        st.error("Market data unavailable. Please try again.")
+    if df.empty or len(df) < 50:
+        st.error("Insufficient market data. Try again later.")
         st.stop()
 
     close = df["Close"]
@@ -54,11 +54,17 @@ try:
     df["EMA21"] = close.ewm(span=21, adjust=False).mean()
 
     delta = close.diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
 
     rs = gain / loss.replace(0, np.nan)
     df["RSI"] = 100 - (100 / (1 + rs))
+
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+
+    df["MACD"] = ema12 - ema26
+    df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
 
     tr = pd.concat([
         high - low,
@@ -66,7 +72,7 @@ try:
         (low - close.shift()).abs()
     ], axis=1).max(axis=1)
 
-    df["ATR"] = tr.rolling(14).mean()
+    df["ATR"] = tr.ewm(alpha=1/14, adjust=False).mean()
 
     last = df.iloc[-1]
 
@@ -75,61 +81,92 @@ try:
     ema21 = float(last["EMA21"])
     rsi = float(last["RSI"])
     atr = float(last["ATR"])
+    macd = float(last["MACD"])
+    macd_signal = float(last["MACD_Signal"])
+
+    if not np.isfinite([price, ema9, ema21, rsi, atr, macd, macd_signal]).all() or atr <= 0:
+        st.error("Indicator data is incomplete. Refresh later.")
+        st.stop()
+
+    bullish = (
+        ema9 > ema21
+        and 50 < rsi < 70
+        and macd > macd_signal
+    )
+
+    bearish = (
+        ema9 < ema21
+        and 30 < rsi < 50
+        and macd < macd_signal
+    )
 
     st.subheader("📊 Market Overview")
 
-    c1, c2, c3 = st.columns(3)
+    a, b, c, d = st.columns(4)
 
-    c1.metric("NIFTY 50", f"{price:,.2f}")
-    c2.metric("RSI (14)", f"{rsi:.2f}")
-    c3.metric("ATR (14)", f"{atr:.2f}")
+    a.metric("NIFTY 50", f"{price:,.2f}")
+    b.metric("RSI", f"{rsi:.2f}")
+    c.metric("ATR", f"{atr:.2f}")
+    d.metric("MACD", f"{macd:.2f}")
 
     st.divider()
 
-    st.subheader("🎯 Trading Signal")
+    st.subheader("🎯 Trading Setup")
 
-    if ema9 > ema21 and 50 < rsi < 70:
-        signal = "BUY"
-        sl = price - (1.2 * atr)
-        risk = price - sl
-        t1 = price + (1.5 * risk)
-        t2 = price + (2 * risk)
+    if bullish:
+        signal = "BULLISH"
+        direction = "CALL BIAS"
+        entry = price
+        sl = price - atr * 1.2
+        risk = entry - sl
 
-    elif ema9 < ema21 and 30 < rsi < 50:
-        signal = "SELL"
-        sl = price + (1.2 * atr)
-        risk = sl - price
-        t1 = price - (1.5 * risk)
-        t2 = price - (2 * risk)
+    elif bearish:
+        signal = "BEARISH"
+        direction = "PUT BIAS"
+        entry = price
+        sl = price + atr * 1.2
+        risk = sl - entry
 
     else:
         signal = "WAIT"
-        sl = t1 = t2 = None
+        direction = "NO TRADE"
+        entry = sl = risk = None
 
-    if signal == "BUY":
-        st.success("🟢 BUY SIGNAL")
-    elif signal == "SELL":
-        st.error("🔴 SELL SIGNAL")
+    if signal == "BULLISH":
+        st.success("🟢 BULLISH - CALL BIAS")
+    elif signal == "BEARISH":
+        st.error("🔴 BEARISH - PUT BIAS")
     else:
-        st.info("🟡 WAIT - No clear setup")
+        st.info("🟡 WAIT - No confirmed setup")
 
     if signal != "WAIT":
-        a, b = st.columns(2)
+        t1 = entry + risk * 1.5 if signal == "BULLISH" else entry - risk * 1.5
+        t2 = entry + risk * 2 if signal == "BULLISH" else entry - risk * 2
+        t3 = entry + risk * 3 if signal == "BULLISH" else entry - risk * 3
 
-        a.metric("Entry Price", f"{price:,.2f}")
-        b.metric("Stop Loss", f"{sl:,.2f}")
+        x, y, z = st.columns(3)
+        x.metric("Possible Entry", f"{entry:,.2f}")
+        y.metric("NIFTY Spot SL", f"{sl:,.2f}")
+        z.metric("Direction", direction)
 
-        a.metric("Target 1", f"{t1:,.2f}")
-        b.metric("Target 2", f"{t2:,.2f}")
+        x, y, z = st.columns(3)
+        x.metric("Target 1", f"{t1:,.2f}")
+        y.metric("Target 2", f"{t2:,.2f}")
+        z.metric("Target 3", f"{t3:,.2f}")
+
+        st.caption(
+            "Targets and SL are calculated on NIFTY spot, "
+            "not option premium."
+        )
 
     st.divider()
 
     st.subheader("📉 Technical Indicators")
 
-    x, y = st.columns(2)
-
+    x, y, z = st.columns(3)
     x.metric("EMA 9", f"{ema9:,.2f}")
     y.metric("EMA 21", f"{ema21:,.2f}")
+    z.metric("MACD Signal", f"{macd_signal:.2f}")
 
     st.line_chart(df[["Close", "EMA9", "EMA21"]])
 
@@ -137,8 +174,9 @@ try:
     st.dataframe(df.tail(10), use_container_width=True)
 
     st.caption(
-        "Data source: Yahoo Finance | "
-        "5-minute data may be delayed or unavailable."
+        f"Last candle timestamp: {df.index[-1]} | "
+        "Source: Yahoo Finance | "
+        "Data may be delayed or incomplete."
     )
 
 except Exception as e:
