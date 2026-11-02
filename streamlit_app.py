@@ -908,27 +908,38 @@ def run_backtest(
 if st.button("🚀 RUN STRATEGY BACKTEST", type="primary"):
     with st.spinner("Downloading historical data and testing strategies..."):
 
-        raw_bt = load_backtest_data(bt_interval)
+                raw_bt = load_backtest_data(bt_interval)
 
         if raw_bt.empty:
             st.error("Historical data unavailable.")
         else:
             bt_df = add_indicators(raw_bt).dropna().copy()
 
-st.write("Available candles:", len(bt_df))
-
-if len(bt_df) < 100:
-    st.warning(
-        f"Only {len(bt_df)} valid candles available. "
-        "At least 100 are required."
-    )
-    st.stop()
+            st.write("Available candles:", len(bt_df))
 
             if len(bt_df) < 100:
-                st.error("Insufficient historical candles.")
+                st.error(
+                    f"Only {len(bt_df)} valid candles available. "
+                    "At least 100 are required."
+                )
             else:
                 strategy_signals = build_strategy_signals(bt_df)
 
+                reports = {}
+
+                for name, signal_series in strategy_signals.items():
+                    report = run_backtest(
+                        bt_df,
+                        signal_series,
+                        risk_atr,
+                        reward_ratio,
+                        int(max_hold),
+                        fee_bps,
+                        slippage_bps
+                    )
+
+                    if report is not None:
+                        reports[name] = report
                 reports = {}
 
                 for name, signal_series in strategy_signals.items():
