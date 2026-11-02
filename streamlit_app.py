@@ -5,46 +5,40 @@ import pandas as pd
 import numpy as np
 
 st.set_page_config(
-    page_title="NIFTY 50 Advanced Dashboard",
+    page_title="NIFTY Options Scanner",
     page_icon="📈",
     layout="wide"
 )
 
-st.title("📈 NIFTY 50 ADVANCED TRADING DASHBOARD")
-st.caption("5-minute technical analysis | Paper trading only")
+st.title("📈 NIFTY 50 OPTIONS SCANNER")
+st.caption("5M + 15M | CALL / PUT | Paper Trading")
 
 st.warning(
-    "Educational tool. Signals are not guaranteed. "
-    "Verify data and option prices before trading."
+    "Educational tool only. CALL/PUT bias is not an option "
+    "premium signal. Verify live prices before trading."
 )
 
 @st.cache_data(ttl=60)
-def get_data():
-    df = yf.download(
+def get_data(interval):
+    return yf.download(
         "^NSEI",
         period="5d",
-        interval="5m",
+        interval=interval,
         progress=False,
         auto_adjust=False
     )
 
+def prepare(df):
     if df.empty:
-        return df
+        return None
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    return df.dropna()
+    df = df.dropna().copy()
 
-if st.button("🔄 Refresh Market Data"):
-    st.cache_data.clear()
-
-try:
-    df = get_data()
-
-    if df.empty or len(df) < 50:
-        st.error("Insufficient market data. Try again later.")
-        st.stop()
+    if len(df) < 50:
+        return None
 
     close = df["Close"]
     high = df["High"]
@@ -64,7 +58,7 @@ try:
     ema26 = close.ewm(span=26, adjust=False).mean()
 
     df["MACD"] = ema12 - ema26
-    df["MACD_Signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_SIGNAL"] = df["MACD"].ewm(span=9, adjust=False).mean()
 
     tr = pd.concat([
         high - low,
@@ -74,112 +68,140 @@ try:
 
     df["ATR"] = tr.ewm(alpha=1/14, adjust=False).mean()
 
-    last = df.iloc[-1]
+    return df
 
-    price = float(last["Close"])
-    ema9 = float(last["EMA9"])
-    ema21 = float(last["EMA21"])
-    rsi = float(last["RSI"])
-    atr = float(last["ATR"])
-    macd = float(last["MACD"])
-    macd_signal = float(last["MACD_Signal"])
+def analyze(df):
+    if df is None:
+        return None
 
-    if not np.isfinite([price, ema9, ema21, rsi, atr, macd, macd_signal]).all() or atr <= 0:
-        st.error("Indicator data is incomplete. Refresh later.")
-        st.stop()
+    row = df.iloc[-1]
+
+    values = [
+        row["Close"], row["EMA9"], row["EMA21"],
+        row["RSI"], row["MACD"], row["MACD_SIGNAL"],
+        row["ATR"]
+    ]
+
+    if not np.isfinite(values).all() or row["ATR"] <= 0:
+        return None
 
     bullish = (
-        ema9 > ema21
-        and 50 < rsi < 70
-        and macd > macd_signal
+        row["EMA9"] > row["EMA21"]
+        and row["RSI"] > 50
+        and row["MACD"] > row["MACD_SIGNAL"]
     )
 
     bearish = (
-        ema9 < ema21
-        and 30 < rsi < 50
-        and macd < macd_signal
+        row["EMA9"] < row["EMA21"]
+        and row["RSI"] < 50
+        and row["MACD"] < row["MACD_SIGNAL"]
     )
 
-    st.subheader("📊 Market Overview")
+    signal = "CALL BIAS" if bullish else "PUT BIAS" if bearish else "WAIT"
 
-    a, b, c, d = st.columns(4)
+    price = float(row["Close"])
+    atr = float(row["ATR"])
 
-    a.metric("NIFTY 50", f"{price:,.2f}")
-    b.metric("RSI", f"{rsi:.2f}")
-    c.metric("ATR", f"{atr:.2f}")
-    d.metric("MACD", f"{macd:.2f}")
+    if signal == "CALL BIAS":
+        sl = price - 1.2 * atr
+        risk = price - sl
+        targets = [price + risk * n for n in (1.5, 2, 3)]
+    elif signal == "PUT BIAS":
+        sl = price + 1.2 * atr
+        risk = sl - price
+        targets = [price - risk * n for n in (1.5, 2, 3)]
+    else:
+        sl = None
+        targets = [None, None, None]
+
+    return {
+        "signal": signal,
+        "price": price,
+        "rsi": float(row["RSI"]),
+        "ema9": float(row["EMA9"]),
+        "ema21": float(row["EMA21"]),
+        "macd": float(row["MACD"]),
+        "atr": atr,
+        "sl": sl,
+        "targets": targets,
+        "time": df.index[-1]
+    }
+
+if st.button("🔄 Refresh Both Timeframes"):
+    st.cache_data.clear()
+
+try:
+    with st.spinner("Loading NIFTY market data..."):
+        df5 = prepare(get_data("5m"))
+        df15 = prepare(get_data("15m"))
+
+        result5 = analyze(df5)
+        result15 = analyze(df15)
+
+    if result5 is None or result15 is None:
+        st.error("Data unavailable or insufficient. Try again later.")
+        st.stop()
+
+    st.subheader("📊 Timeframe Comparison")
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown("### 5 MINUTE")
+        st.metric("NIFTY Spot", f'{result5["price"]:,.2f}')
+        st.metric("Signal", result5["signal"])
+        st.metric("RSI", f'{result5["rsi"]:.2f}')
+
+    with c2:
+        st.markdown("### 15 MINUTE")
+        st.metric("NIFTY Spot", f'{result15["price"]:,.2f}')
+        st.metric("Signal", result15["signal"])
+        st.metric("RSI", f'{result15["rsi"]:.2f}')
 
     st.divider()
 
-    st.subheader("🎯 Trading Setup")
+    st.subheader("🎯 FINAL TRADE FILTER")
 
-    if bullish:
-        signal = "BULLISH"
-        direction = "CALL BIAS"
-        entry = price
-        sl = price - atr * 1.2
-        risk = entry - sl
+    if result5["signal"] == result15["signal"] and result5["signal"] != "WAIT":
+        final_signal = result5["signal"]
+        st.success(f"CONFIRMED DIRECTION: {final_signal}")
+        st.caption("Both timeframes agree. This is a paper-trading setup, not a trade instruction.")
 
-    elif bearish:
-        signal = "BEARISH"
-        direction = "PUT BIAS"
-        entry = price
-        sl = price + atr * 1.2
-        risk = sl - entry
+        st.metric("Possible NIFTY Spot Entry", f'{result5["price"]:,.2f}')
+        st.metric("NIFTY Spot Stop Loss", f'{result5["sl"]:,.2f}')
 
+        a, b, c = st.columns(3)
+
+        a.metric("Target 1", f'{result5["targets"][0]:,.2f}')
+        b.metric("Target 2", f'{result5["targets"][1]:,.2f}')
+        c.metric("Target 3", f'{result5["targets"][2]:,.2f}')
+
+        st.info("These levels refer to NIFTY spot, NOT option premium.")
     else:
-        signal = "WAIT"
-        direction = "NO TRADE"
-        entry = sl = risk = None
-
-    if signal == "BULLISH":
-        st.success("🟢 BULLISH - CALL BIAS")
-    elif signal == "BEARISH":
-        st.error("🔴 BEARISH - PUT BIAS")
-    else:
-        st.info("🟡 WAIT - No confirmed setup")
-
-    if signal != "WAIT":
-        t1 = entry + risk * 1.5 if signal == "BULLISH" else entry - risk * 1.5
-        t2 = entry + risk * 2 if signal == "BULLISH" else entry - risk * 2
-        t3 = entry + risk * 3 if signal == "BULLISH" else entry - risk * 3
-
-        x, y, z = st.columns(3)
-        x.metric("Possible Entry", f"{entry:,.2f}")
-        y.metric("NIFTY Spot SL", f"{sl:,.2f}")
-        z.metric("Direction", direction)
-
-        x, y, z = st.columns(3)
-        x.metric("Target 1", f"{t1:,.2f}")
-        y.metric("Target 2", f"{t2:,.2f}")
-        z.metric("Target 3", f"{t3:,.2f}")
-
-        st.caption(
-            "Targets and SL are calculated on NIFTY spot, "
-            "not option premium."
-        )
+        st.warning("WAIT - No confirmed setup. Timeframes do not agree.")
 
     st.divider()
 
-    st.subheader("📉 Technical Indicators")
+    st.subheader("📈 Technical Indicators")
 
-    x, y, z = st.columns(3)
-    x.metric("EMA 9", f"{ema9:,.2f}")
-    y.metric("EMA 21", f"{ema21:,.2f}")
-    z.metric("MACD Signal", f"{macd_signal:.2f}")
+    st.write("5-minute chart")
+    st.line_chart(df5[["Close", "EMA9", "EMA21"]])
 
-    st.line_chart(df[["Close", "EMA9", "EMA21"]])
+    st.write("15-minute chart")
+    st.line_chart(df15[["Close", "EMA9", "EMA21"]])
 
-    st.subheader("📋 Latest Market Data")
-    st.dataframe(df.tail(10), use_container_width=True)
+    st.subheader("📋 Latest Data")
+    st.write("5-minute candle:", result5["time"])
+    st.write("15-minute candle:", result15["time"])
 
     st.caption(
-        f"Last candle timestamp: {df.index[-1]} | "
-        "Source: Yahoo Finance | "
-        "Data may be delayed or incomplete."
+        "Source: Yahoo Finance. Data can be delayed or unavailable. "
+        "No live option-chain or option-premium data is included."
     )
 
 except Exception as e:
     st.error(f"Data error: {e}")
-    st.info("Please refresh and try again.")
+    st.info("Refresh and try again later.")
+    
+
     
