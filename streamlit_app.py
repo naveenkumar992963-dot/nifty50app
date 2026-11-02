@@ -5,22 +5,22 @@ import pandas as pd
 import numpy as np
 
 st.set_page_config(
-    page_title="NIFTY Options Scanner",
+    page_title="NIFTY Advanced Scanner",
     page_icon="📈",
     layout="wide"
 )
 
-st.title("📈 NIFTY 50 OPTIONS SCANNER")
-st.caption("5M + 15M | CALL / PUT | Paper Trading")
+st.title("📈 NIFTY 50 ADVANCED SCANNER")
+st.caption("5M + 15M | Strength Meter | Paper Trading")
 
 st.warning(
-    "Educational tool only. CALL/PUT bias is not an option "
-    "premium signal. Verify live prices before trading."
+    "Educational tool only. Scores are rule-based indicators, "
+    "not probabilities of profit or guaranteed trading signals."
 )
 
 @st.cache_data(ttl=60)
 def get_data(interval):
-    return yf.download(
+    df = yf.download(
         "^NSEI",
         period="5d",
         interval=interval,
@@ -28,16 +28,19 @@ def get_data(interval):
         auto_adjust=False
     )
 
-def prepare(df):
     if df.empty:
-        return None
+        return df
 
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
-    df = df.dropna().copy()
+    return df.dropna().copy()
 
-    if len(df) < 50:
+
+def analyze(interval):
+    df = get_data(interval)
+
+    if df.empty or len(df) < 50:
         return None
 
     close = df["Close"]
@@ -68,36 +71,43 @@ def prepare(df):
 
     df["ATR"] = tr.ewm(alpha=1/14, adjust=False).mean()
 
-    return df
-
-def analyze(df):
-    if df is None:
-        return None
-
     row = df.iloc[-1]
 
-    values = [
+    vals = [
         row["Close"], row["EMA9"], row["EMA21"],
         row["RSI"], row["MACD"], row["MACD_SIGNAL"],
         row["ATR"]
     ]
 
-    if not np.isfinite(values).all() or row["ATR"] <= 0:
+    if not np.isfinite(vals).all() or row["ATR"] <= 0:
         return None
 
-    bullish = (
-        row["EMA9"] > row["EMA21"]
-        and row["RSI"] > 50
-        and row["MACD"] > row["MACD_SIGNAL"]
-    )
+    bull = 0
+    bear = 0
 
-    bearish = (
-        row["EMA9"] < row["EMA21"]
-        and row["RSI"] < 50
-        and row["MACD"] < row["MACD_SIGNAL"]
-    )
+    if row["EMA9"] > row["EMA21"]:
+        bull += 40
+    elif row["EMA9"] < row["EMA21"]:
+        bear += 40
 
-    signal = "CALL BIAS" if bullish else "PUT BIAS" if bearish else "WAIT"
+    if row["RSI"] > 55:
+        bull += 30
+    elif row["RSI"] < 45:
+        bear += 30
+    else:
+        bull += 10
+        bear += 10
+
+    if row["MACD"] > row["MACD_SIGNAL"]:
+        bull += 30
+    elif row["MACD"] < row["MACD_SIGNAL"]:
+        bear += 30
+
+    signal = (
+        "CALL BIAS" if bull >= 70
+        else "PUT BIAS" if bear >= 70
+        else "WAIT"
+    )
 
     price = float(row["Close"])
     atr = float(row["ATR"])
@@ -115,93 +125,105 @@ def analyze(df):
         targets = [None, None, None]
 
     return {
-        "signal": signal,
+        "df": df,
         "price": price,
+        "bull": bull,
+        "bear": bear,
+        "signal": signal,
         "rsi": float(row["RSI"]),
-        "ema9": float(row["EMA9"]),
-        "ema21": float(row["EMA21"]),
-        "macd": float(row["MACD"]),
         "atr": atr,
         "sl": sl,
         "targets": targets,
         "time": df.index[-1]
     }
 
-if st.button("🔄 Refresh Both Timeframes"):
+
+if st.button("🔄 Refresh Scanner"):
     st.cache_data.clear()
 
 try:
-    with st.spinner("Loading NIFTY market data..."):
-        df5 = prepare(get_data("5m"))
-        df15 = prepare(get_data("15m"))
+    with st.spinner("Analyzing 5M and 15M market data..."):
+        r5 = analyze("5m")
+        r15 = analyze("15m")
 
-        result5 = analyze(df5)
-        result15 = analyze(df15)
-
-    if result5 is None or result15 is None:
-        st.error("Data unavailable or insufficient. Try again later.")
+    if r5 is None or r15 is None:
+        st.error("Market data unavailable or insufficient.")
         st.stop()
 
-    st.subheader("📊 Timeframe Comparison")
+    st.subheader("📊 Timeframe Signals")
 
     c1, c2 = st.columns(2)
 
     with c1:
         st.markdown("### 5 MINUTE")
-        st.metric("NIFTY Spot", f'{result5["price"]:,.2f}')
-        st.metric("Signal", result5["signal"])
-        st.metric("RSI", f'{result5["rsi"]:.2f}')
+        st.metric("NIFTY Spot", f'{r5["price"]:,.2f}')
+        st.metric("Signal", r5["signal"])
+        st.metric("Bullish Score", f'{r5["bull"]}%')
+        st.progress(r5["bull"] / 100)
+        st.metric("Bearish Score", f'{r5["bear"]}%')
+        st.progress(r5["bear"] / 100)
+        st.metric("RSI", f'{r5["rsi"]:.2f}')
 
     with c2:
         st.markdown("### 15 MINUTE")
-        st.metric("NIFTY Spot", f'{result15["price"]:,.2f}')
-        st.metric("Signal", result15["signal"])
-        st.metric("RSI", f'{result15["rsi"]:.2f}')
+        st.metric("NIFTY Spot", f'{r15["price"]:,.2f}')
+        st.metric("Signal", r15["signal"])
+        st.metric("Bullish Score", f'{r15["bull"]}%')
+        st.progress(r15["bull"] / 100)
+        st.metric("Bearish Score", f'{r15["bear"]}%')
+        st.progress(r15["bear"] / 100)
+        st.metric("RSI", f'{r15["rsi"]:.2f}')
 
     st.divider()
+    st.subheader("🎯 FINAL CONFIRMATION")
 
-    st.subheader("🎯 FINAL TRADE FILTER")
-
-    if result5["signal"] == result15["signal"] and result5["signal"] != "WAIT":
-        final_signal = result5["signal"]
-        st.success(f"CONFIRMED DIRECTION: {final_signal}")
-        st.caption("Both timeframes agree. This is a paper-trading setup, not a trade instruction.")
-
-        st.metric("Possible NIFTY Spot Entry", f'{result5["price"]:,.2f}')
-        st.metric("NIFTY Spot Stop Loss", f'{result5["sl"]:,.2f}')
+    if r5["signal"] == r15["signal"] and r5["signal"] != "WAIT":
+        final = r5["signal"]
+        st.success(f"CONFIRMED DIRECTION: {final}")
+        st.metric("Confirmation Meter", "2 / 2")
+        
+        st.metric("NIFTY Spot Entry Reference", f'{r5["price"]:,.2f}')
+        st.metric("NIFTY Spot Stop Loss", f'{r5["sl"]:,.2f}')
 
         a, b, c = st.columns(3)
+        a.metric("Target 1", f'{r5["targets"][0]:,.2f}')
+        b.metric("Target 2", f'{r5["targets"][1]:,.2f}')
+        c.metric("Target 3", f'{r5["targets"][2]:,.2f}')
 
-        a.metric("Target 1", f'{result5["targets"][0]:,.2f}')
-        b.metric("Target 2", f'{result5["targets"][1]:,.2f}')
-        c.metric("Target 3", f'{result5["targets"][2]:,.2f}')
-
-        st.info("These levels refer to NIFTY spot, NOT option premium.")
     else:
-        st.warning("WAIT - No confirmed setup. Timeframes do not agree.")
+        st.warning("WAIT - No confirmed setup")
+        st.metric(
+            "Confirmation Meter",
+            f'{int(r5["signal"] != "WAIT") + int(r15["signal"] != "WAIT")} / 2'
+        )
+
+    st.caption(
+        "Confirmation means both rule-based signals agree. "
+        "It does not mean a 100% probability of success."
+    )
+
+    st.info(
+        "Entry, SL and targets are NIFTY SPOT reference levels, "
+        "not CALL/PUT option premium levels."
+    )
 
     st.divider()
 
-    st.subheader("📈 Technical Indicators")
+    st.subheader("📈 5M Technical Chart")
+    st.line_chart(r5["df"][["Close", "EMA9", "EMA21"]])
 
-    st.write("5-minute chart")
-    st.line_chart(df5[["Close", "EMA9", "EMA21"]])
+    st.subheader("📈 15M Technical Chart")
+    st.line_chart(r15["df"][["Close", "EMA9", "EMA21"]])
 
-    st.write("15-minute chart")
-    st.line_chart(df15[["Close", "EMA9", "EMA21"]])
-
-    st.subheader("📋 Latest Data")
-    st.write("5-minute candle:", result5["time"])
-    st.write("15-minute candle:", result15["time"])
+    st.subheader("🕒 Data Timestamps")
+    st.write("5M:", r5["time"])
+    st.write("15M:", r15["time"])
 
     st.caption(
-        "Source: Yahoo Finance. Data can be delayed or unavailable. "
-        "No live option-chain or option-premium data is included."
+        "Source: Yahoo Finance. Data may be delayed. "
+        "Use paper trading and verify completed candles."
     )
 
 except Exception as e:
-    st.error(f"Data error: {e}")
-    st.info("Refresh and try again later.")
-    
-
-    
+    st.error(f"Scanner error: {e}")
+        
