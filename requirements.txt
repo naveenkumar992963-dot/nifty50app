@@ -1,5 +1,181 @@
-streamlit>=1.36
-requests>=2.31
-pandas>=2.1
-numpy>=1.26
 
+import requests
+import pandas as pd
+from datetime import date, timedelta
+from urllib.parse import quote
+
+BASE_URL = "https://api.upstox.com"
+
+
+class UpstoxError(Exception):
+    pass
+
+
+class UpstoxClient:
+
+    def __init__(self, access_token):
+        self.access_token = access_token
+
+    def _get(self, endpoint, params=None):
+
+        headers = {
+            "Accept": "application/json",
+            "Api-Version": "2.0",
+            "Authorization": f"Bearer {self.access_token}"
+        }
+
+        try:
+            response = requests.get(
+                BASE_URL + endpoint,
+                headers=headers,
+                params=params,
+                timeout=25
+            )
+
+        except requests.RequestException as error:
+            raise UpstoxError(
+                f"Network Error: {error}"
+            )
+
+        if response.status_code != 200:
+            raise UpstoxError(
+                f"HTTP {response.status_code}: {response.text[:700]}"
+            )
+
+        try:
+            result = response.json()
+        except ValueError:
+            raise UpstoxError(
+                "API returned invalid JSON"
+            )
+
+        if result.get("status") == "error":
+            raise UpstoxError(str(result))
+
+        return result.get("data", {})
+
+    @staticmethod
+    def _convert_candles(data):
+
+        rows = data.get("candles", [])
+
+        if not rows:
+            return pd.DataFrame(
+                columns=[
+                    "timestamp",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "oi"
+                ]
+            )
+
+        df = pd.DataFrame(
+            rows,
+            columns=[
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "oi"
+            ]
+        )
+
+        df["timestamp"] = pd.to_datetime(
+            df["timestamp"],
+            errors="coerce"
+        )
+
+        for column in [
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "oi"
+        ]:
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce"
+            )
+
+        return (
+            df.dropna(subset=["timestamp", "close"])
+            .sort_values("timestamp")
+            .drop_duplicates("timestamp")
+            .reset_index(drop=True)
+        )
+
+    def intraday_candles(
+        self,
+        instrument_key,
+        interval
+    ):
+
+        endpoint = (
+            "/v3/historical-candle/intraday/"
+            f"{quote(instrument_key, safe='')}"
+            f"/minutes/{interval}"
+        )
+
+        data = self._get(endpoint)
+
+        return self._convert_candles(data)
+
+    def historical_candles(
+        self,
+        instrument_key,
+        interval,
+        days=90
+    ):
+
+        end_date = date.today()
+
+        start_date = (
+            end_date - timedelta(days=days)
+        )
+
+        endpoint = (
+            "/v3/historical-candle/"
+            f"{quote(instrument_key, safe='')}"
+            f"/minutes/{interval}/"
+            f"{end_date.isoformat()}/"
+            f"{start_date.isoformat()}"
+        )
+
+        data = self._get(endpoint)
+
+        return self._convert_candles(data)
+
+    def option_chain(
+        self,
+        instrument_key,
+        expiry_date
+    ):
+
+        data = self._get(
+            "/v2/option/chain",
+            {
+                "instrument_key": instrument_key,
+                "expiry_date": expiry_date
+            }
+        )
+
+        if isinstance(data, list):
+            return data
+
+        if isinstance(data, dict):
+
+            for key in [
+                "option_chain",
+                "data"
+            ]:
+
+                if isinstance(data.get(key), list):
+                    return data[key]
+
+        return []
