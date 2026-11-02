@@ -1,792 +1,496 @@
 
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
 import streamlit as st
 import yfinance as yf
-import pandas as pd
-import numpy as np
 
 st.set_page_config(
-    page_title="NIFTY Advanced Scanner",
+    page_title="NIFTY 50 Advanced Analysis",
     page_icon="📈",
     layout="wide"
 )
 
+SYMBOLS = {
+    "NIFTY 50": "^NSEI",
+    "BANK NIFTY": "^NSEBANK",
+    "FIN NIFTY": "^CNXFIN",
+    "SENSEX": "^BSESN",
+    "NIFTY MIDCAP SELECT": "^NSEMDCP50"
+}
+
+INTERVALS = {
+    "5 min": ("5m", "5d"),
+    "15 min": ("15m", "1mo"),
+    "30 min": ("30m", "1mo"),
+    "1 hour": ("60m", "3mo")
+}
+
 st.title("📈 NIFTY 50 ADVANCED PREDICTION ENGINE")
-st.caption("Multi-Strategy | 30,000 Scenarios | Backtesting | Paper Analysis")
+st.caption("Market analysis dashboard — signals are estimates, not guaranteed predictions.")
 
-st.warning(
-    "Educational tool only. Scenario shares are simulations, "
-    "not guaranteed probabilities or trading success."
-)
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/period, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return (100 - 100/(1+rs)).fillna(50)
 
-SCENARIOS = 30000
+def download_data(symbol, interval, period):
+    data = yf.download(
+        symbol,
+        period=period,
+        interval=interval,
+        progress=False,
+        auto_adjust=False,
+        threads=False
+    )
 
-
-# =====================================================
-# 1. MARKET DATA
-# =====================================================
-
-@st.cache_data(ttl=60)
-def get_data(interval, period):
-    try:
-        df = yf.download(
-            "^NSEI",
-            period=period,
-            interval=interval,
-            progress=False,
-            auto_adjust=False
-        )
-
-        if df.empty:
-            return pd.DataFrame()
-
-        if isinstance(df.columns, pd.MultiIndex):
-            for level in range(df.columns.nlevels):
-                names = df.columns.get_level_values(level)
-                if "Close" in names:
-                    df.columns = names
-                    break
-
-        required = ["Open", "High", "Low", "Close"]
-
-        if not all(c in df.columns for c in required):
-            return pd.DataFrame()
-
-        return df.dropna(subset=required).copy()
-
-    except Exception:
+    if data is None or data.empty:
         return pd.DataFrame()
 
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
 
-# =====================================================
-# 2. TECHNICAL INDICATORS
-# =====================================================
+    required = ["Open", "High", "Low", "Close", "Volume"]
+
+    if not all(c in data.columns for c in required):
+        return pd.DataFrame()
+
+    data = data[required].copy()
+
+    for col in required:
+        data[col] = pd.to_numeric(data[col], errors="coerce")
+
+    return data.dropna(subset=["Open", "High", "Low", "Close"])
 
 def add_indicators(df):
-    x = df.copy()
+    out = df.copy()
 
-    close = x["Close"].astype(float)
-    high = x["High"].astype(float)
-    low = x["Low"].astype(float)
+    close = out["Close"]
+    high = out["High"]
+    low = out["Low"]
 
-    if "Volume" in x.columns:
-        volume = x["Volume"].astype(float)
-    else:
-        volume = pd.Series(0.0, index=x.index)
+    out["EMA9"] = close.ewm(span=9, adjust=False).mean()
+    out["EMA21"] = close.ewm(span=21, adjust=False).mean()
+    out["EMA50"] = close.ewm(span=50, adjust=False).mean()
 
-    for n in [9, 21, 50, 200]:
-        x[f"EMA{n}"] = close.ewm(
-            span=n, adjust=False
-        ).mean()
+    out["RSI"] = rsi(close)
 
-    # RSI
-    delta = close.diff()
-    gain = delta.clip(lower=0).ewm(
-        alpha=1/14, adjust=False
-    ).mean()
-    loss = (-delta.clip(upper=0)).ewm(
-        alpha=1/14, adjust=False
-    ).mean()
+    fast = close.ewm(span=12, adjust=False).mean()
+    slow = close.ewm(span=26, adjust=False).mean()
 
-    rs = gain / loss.replace(0, np.nan)
-    x["RSI"] = 100 - 100 / (1 + rs)
+    out["MACD"] = fast - slow
+    out["MACD_signal"] = out["MACD"].ewm(span=9, adjust=False).mean()
 
-    # MACD
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
+    previous_close = close.shift(1)
 
-    x["MACD"] = ema12 - ema26
-    x["MACD_SIGNAL"] = x["MACD"].ewm(
-        span=9, adjust=False
-    ).mean()
-
-    # ATR
     tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
+        high-low,
+        (high-previous_close).abs(),
+        (low-previous_close).abs()
     ], axis=1).max(axis=1)
 
-    x["ATR"] = tr.ewm(
-        alpha=1/14, adjust=False
-    ).mean()
+    out["ATR"] = tr.ewm(alpha=1/14, adjust=False).mean()
 
-    # ADX
-    up = high.diff()
-    down = -low.diff()
+    typical = (high+low+close)/3
+    volume = out["Volume"].replace(0, np.nan)
 
-    plus_dm = pd.Series(
-        np.where((up > down) & (up > 0), up, 0),
-        index=x.index
-    )
+    out["VWAP"] = (
+        (typical*volume).groupby(out.index.date).cumsum()
+        / volume.groupby(out.index.date).cumsum()
+    ).fillna(close)
 
-    minus_dm = pd.Series(
-        np.where((down > up) & (down > 0), down, 0),
-        index=x.index
-    )
+    midpoint = (high+low)/2
+    upper = midpoint + 3*out["ATR"]
+    lower = midpoint - 3*out["ATR"]
 
-    atr14 = tr.ewm(alpha=1/14, adjust=False).mean()
+    st_line = pd.Series(index=out.index, dtype=float)
+    trend_up = pd.Series(index=out.index, dtype=bool)
 
-    plus_di = 100 * plus_dm.ewm(
-        alpha=1/14, adjust=False
-    ).mean() / atr14.replace(0, np.nan)
+    for i in range(len(out)):
+        if i == 0:
+            st_line.iloc[i] = lower.iloc[i]
+            trend_up.iloc[i] = True
+            continue
 
-    minus_di = 100 * minus_dm.ewm(
-        alpha=1/14, adjust=False
-    ).mean() / atr14.replace(0, np.nan)
+        prev_line = st_line.iloc[i-1]
 
-    dx = 100 * (plus_di - minus_di).abs() / (
-        plus_di + minus_di
-    ).replace(0, np.nan)
-
-    x["PLUS_DI"] = plus_di
-    x["MINUS_DI"] = minus_di
-    x["ADX"] = dx.ewm(
-        alpha=1/14, adjust=False
-    ).mean()
-
-    # Bollinger Bands
-    middle = close.rolling(20).mean()
-    std = close.rolling(20).std()
-
-    x["BB_UPPER"] = middle + 2 * std
-    x["BB_LOWER"] = middle - 2 * std
-
-    # Intraday VWAP
-    typical = (high + low + close) / 3
-    dates = pd.Series(x.index.date, index=x.index)
-
-    cumulative_pv = (typical * volume).groupby(dates).cumsum()
-    cumulative_volume = volume.groupby(dates).cumsum()
-
-    x["VWAP"] = (
-        cumulative_pv / cumulative_volume.replace(0, np.nan)
-    )
-
-    # Volume ratio
-    avg_volume = volume.rolling(20).mean()
-    x["VOLUME_RATIO"] = (
-        volume / avg_volume.replace(0, np.nan)
-    )
-
-    # Supertrend
-    midpoint = (high + low) / 2
-    basic_upper = midpoint + 3 * x["ATR"]
-    basic_lower = midpoint - 3 * x["ATR"]
-
-    final_upper = basic_upper.copy()
-    final_lower = basic_lower.copy()
-
-    direction = pd.Series(1, index=x.index)
-    supertrend = pd.Series(np.nan, index=x.index)
-
-    for i in range(1, len(x)):
-        if (
-            basic_upper.iloc[i] < final_upper.iloc[i-1]
-            or close.iloc[i-1] > final_upper.iloc[i-1]
-        ):
-            final_upper.iloc[i] = basic_upper.iloc[i]
-
-        if (
-            basic_lower.iloc[i] > final_lower.iloc[i-1]
-            or close.iloc[i-1] < final_lower.iloc[i-1]
-        ):
-            final_lower.iloc[i] = basic_lower.iloc[i]
-
-        if direction.iloc[i-1] == 1:
-            direction.iloc[i] = (
-                -1 if close.iloc[i] < final_lower.iloc[i]
-                else 1
+        if close.iloc[i] >= prev_line:
+            trend_up.iloc[i] = True
+            st_line.iloc[i] = (
+                max(lower.iloc[i], prev_line)
+                if trend_up.iloc[i-1] else lower.iloc[i]
             )
         else:
-            direction.iloc[i] = (
-                1 if close.iloc[i] > final_upper.iloc[i]
-                else -1
+            trend_up.iloc[i] = False
+            st_line.iloc[i] = (
+                min(upper.iloc[i], prev_line)
+                if not trend_up.iloc[i-1] else upper.iloc[i]
             )
 
-        supertrend.iloc[i] = (
-            final_lower.iloc[i]
-            if direction.iloc[i] == 1
-            else final_upper.iloc[i]
-        )
+    out["Supertrend"] = st_line.ffill()
+    out["ST_Up"] = trend_up.fillna(True)
 
-    x["ST_DIRECTION"] = direction
-    x["SUPERTREND"] = supertrend
+    return out.replace([np.inf, -np.inf], np.nan).dropna(
+        subset=["EMA50", "RSI", "MACD", "ATR"]
+    )
 
-    # Previous 20 candle breakout levels
-    x["PREV_HIGH"] = high.shift(1).rolling(20).max()
-    x["PREV_LOW"] = low.shift(1).rolling(20).min()
+def signal_for(df):
+    last = df.iloc[-1]
 
-    return x
-
-
-# =====================================================
-# 3. MULTI-STRATEGY SCANNER
-# =====================================================
-
-def analyze_market(df):
-    if len(df) < 50:
-        return None
-
-    row = df.iloc[-1]
-
-    required = [
-        "Close", "EMA9", "EMA21", "EMA50",
-        "RSI", "MACD", "MACD_SIGNAL",
-        "ATR", "ADX", "PLUS_DI", "MINUS_DI"
-    ]
-
-    if not np.isfinite([row[c] for c in required]).all():
-        return None
-
-    bull = 0
-    bear = 0
+    score = 0
     reasons = []
 
-    # EMA alignment
-    if row["EMA9"] > row["EMA21"] > row["EMA50"]:
-        bull += 20
-        reasons.append("Bullish EMA alignment")
-    elif row["EMA9"] < row["EMA21"] < row["EMA50"]:
-        bear += 20
-        reasons.append("Bearish EMA alignment")
+    checks = [
+        (last["EMA9"] > last["EMA21"], "EMA 9 / EMA 21"),
+        (last["Close"] > last["EMA50"], "EMA 50"),
+        (last["MACD"] > last["MACD_signal"], "MACD"),
+        (last["Close"] > last["VWAP"], "VWAP"),
+        (bool(last["ST_Up"]), "Supertrend")
+    ]
 
-    # MACD
-    if row["MACD"] > row["MACD_SIGNAL"]:
-        bull += 15
-        reasons.append("MACD bullish")
-    else:
-        bear += 15
-        reasons.append("MACD bearish")
-
-    # RSI
-    if 55 < row["RSI"] < 75:
-        bull += 15
-        reasons.append("RSI bullish")
-    elif 25 < row["RSI"] < 45:
-        bear += 15
-        reasons.append("RSI bearish")
-
-    # VWAP
-    if np.isfinite(row["VWAP"]):
-        if row["Close"] > row["VWAP"]:
-            bull += 15
-            reasons.append("Price above VWAP")
+    for condition, name in checks:
+        if condition:
+            score += 1
+            reasons.append(name + " bullish")
         else:
-            bear += 15
-            reasons.append("Price below VWAP")
+            score -= 1
+            reasons.append(name + " bearish")
 
-    # ADX
-    if row["ADX"] > 20:
-        if row["PLUS_DI"] > row["MINUS_DI"]:
-            bull += 10
-            reasons.append("ADX bullish trend")
-        else:
-            bear += 10
-            reasons.append("ADX bearish trend")
-
-    # Supertrend
-    if row["ST_DIRECTION"] == 1:
-        bull += 10
-        reasons.append("Supertrend bullish")
+    if score >= 3:
+        signal = "BULLISH"
+    elif score <= -3:
+        signal = "BEARISH"
     else:
-        bear += 10
-        reasons.append("Supertrend bearish")
+        signal = "WAIT / SIDEWAYS"
 
-    # Breakout
-    if np.isfinite(row["PREV_HIGH"]) and row["Close"] > row["PREV_HIGH"]:
-        bull += 10
-        reasons.append("20 candle high breakout")
+    price = float(last["Close"])
+    atr = max(float(last["ATR"]), price*0.001)
 
-    elif np.isfinite(row["PREV_LOW"]) and row["Close"] < row["PREV_LOW"]:
-        bear += 10
-        reasons.append("20 candle low breakdown")
+    if signal == "BULLISH":
+        sl = price - 1.5*atr
+        target1 = price + 1.5*atr
+        target2 = price + 3*atr
 
-    # Volume
-    if (
-        np.isfinite(row["VOLUME_RATIO"])
-        and row["VOLUME_RATIO"] > 1.5
-    ):
-        if row["Close"] > row["Open"]:
-            bull += 5
-            reasons.append("High bullish volume")
-        elif row["Close"] < row["Open"]:
-            bear += 5
-            reasons.append("High bearish volume")
+    elif signal == "BEARISH":
+        sl = price + 1.5*atr
+        target1 = price - 1.5*atr
+        target2 = price - 3*atr
 
-    if bull >= 65 and bull - bear >= 20:
-        signal = "CALL BIAS"
-    elif bear >= 65 and bear - bull >= 20:
-        signal = "PUT BIAS"
     else:
-        signal = "WAIT"
+        sl = np.nan
+        target1 = np.nan
+        target2 = np.nan
 
     return {
-        "df": df,
-        "price": float(row["Close"]),
-        "bull": bull,
-        "bear": bear,
         "signal": signal,
-        "rsi": float(row["RSI"]),
-        "atr": float(row["ATR"]),
-        "adx": float(row["ADX"]),
-        "time": df.index[-1],
+        "score": score,
+        "price": price,
+        "sl": sl,
+        "target1": target1,
+        "target2": target2,
+        "rsi": float(last["RSI"]),
+        "atr": atr,
         "reasons": reasons
     }
 
+def build_strategy_signals(df):
+    out = df.copy()
 
-# =====================================================
-# 4. 30,000 MONTE CARLO SCENARIOS
-# =====================================================
-
-def simulate_scenarios(df):
-    close = df["Close"].astype(float)
-    returns = np.log(close / close.shift()).dropna()
-
-    if len(returns) < 50:
-        return None
-
-    recent = returns.tail(96)
-
-    if len(recent) < 30:
-        return None
-
-    drift = (
-        0.35 * returns.tail(12).mean()
-        + 0.15 * returns.tail(48).mean()
+    long_condition = (
+        (out["EMA9"] > out["EMA21"])
+        & (out["MACD"] > out["MACD_signal"])
+        & (out["Close"] > out["EMA50"])
     )
 
-    residuals = (
-        recent - recent.mean()
-    ).dropna().to_numpy()
+    short_condition = (
+        (out["EMA9"] < out["EMA21"])
+        & (out["MACD"] < out["MACD_signal"])
+        & (out["Close"] < out["EMA50"])
+    )
 
-    volatility = recent.std()
+    out["Position"] = np.select(
+        [long_condition, short_condition],
+        [1, -1],
+        default=0
+    )
 
-    if len(residuals) < 20 or not np.isfinite(volatility) or volatility <= 0:
+    out["Market_Return"] = out["Close"].pct_change().fillna(0)
+
+    out["Strategy_Return"] = (
+        out["Position"].shift(1).fillna(0)
+        * out["Market_Return"]
+    )
+
+    out["Equity"] = (1+out["Strategy_Return"]).cumprod()
+    out["Buy_Hold"] = (1+out["Market_Return"]).cumprod()
+
+    return out
+
+def run_backtest(df):
+    bt = build_strategy_signals(df)
+
+    active = bt.loc[
+        bt["Position"].shift(1).fillna(0) != 0,
+        "Strategy_Return"
+    ]
+
+    win_rate = (
+        (active > 0).mean()*100
+        if len(active) else 0
+    )
+
+    drawdown = bt["Equity"]/bt["Equity"].cummax()-1
+
+    return {
+        "data": bt,
+        "return": (bt["Equity"].iloc[-1]-1)*100,
+        "buy_hold": (bt["Buy_Hold"].iloc[-1]-1)*100,
+        "win_rate": win_rate,
+        "max_drawdown": drawdown.min()*100
+    }
+
+def monte_carlo_projection(df, simulations=30000, steps=20):
+    returns = df["Close"].pct_change().dropna().to_numpy()
+
+    if len(returns) < 30:
         return None
 
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(42)
 
-    samples = rng.choice(
-        residuals,
-        size=(SCENARIOS, 6),
+    sample = rng.choice(
+        returns,
+        size=(simulations, steps),
         replace=True
     )
 
-    simulated_returns = samples + drift
-
-    final_returns = np.exp(
-        simulated_returns.sum(axis=1)
-    ) - 1
-
-    price = float(close.iloc[-1])
-    atr = float(df["ATR"].iloc[-1])
-
-    threshold = max(
-        0.20 * atr / price,
-        volatility * np.sqrt(6) * 0.15
-    )
-
-    bullish = int(np.sum(final_returns > threshold))
-    bearish = int(np.sum(final_returns < -threshold))
-    sideways = SCENARIOS - bullish - bearish
+    paths = df["Close"].iloc[-1] * np.cumprod(1+sample, axis=1)
+    final_values = paths[:, -1]
 
     return {
-        "bullish": bullish,
-        "bearish": bearish,
-        "sideways": sideways,
-        "bull_pct": bullish / SCENARIOS * 100,
-        "bear_pct": bearish / SCENARIOS * 100,
-        "side_pct": sideways / SCENARIOS * 100
+        "p10": np.percentile(final_values, 10),
+        "p50": np.percentile(final_values, 50),
+        "p90": np.percentile(final_values, 90),
+        "up_probability": (
+            final_values > df["Close"].iloc[-1]
+        ).mean()*100
     }
 
+# SIDEBAR
 
-# =====================================================
-# 5. BACKTEST STRATEGY SIGNALS
-# =====================================================
+with st.sidebar:
+    st.header("⚙️ Settings")
 
-def build_strategy_signals(df):
-    x = df
-    close = x["Close"]
-
-    ema = pd.Series(0, index=x.index)
-    ema.loc[
-        (x["EMA9"] > x["EMA21"]) &
-        (x["EMA9"].shift(1) <= x["EMA21"].shift(1))
-    ] = 1
-    ema.loc[
-        (x["EMA9"] < x["EMA21"]) &
-        (x["EMA9"].shift(1) >= x["EMA21"].shift(1))
-    ] = -1
-
-    rsi = pd.Series(0, index=x.index)
-    rsi.loc[
-        (x["RSI"] > 30) & (x["RSI"].shift(1) <= 30)
-    ] = 1
-    rsi.loc[
-        (x["RSI"] < 70) & (x["RSI"].shift(1) >= 70)
-    ] = -1
-
-    macd = pd.Series(0, index=x.index)
-    macd.loc[
-        (x["MACD"] > x["MACD_SIGNAL"]) &
-        (x["MACD"].shift(1) <= x["MACD_SIGNAL"].shift(1))
-    ] = 1
-    macd.loc[
-        (x["MACD"] < x["MACD_SIGNAL"]) &
-        (x["MACD"].shift(1) >= x["MACD_SIGNAL"].shift(1))
-    ] = -1
-
-    vwap = pd.Series(0, index=x.index)
-    vwap.loc[
-        (close > x["VWAP"]) &
-        (close.shift(1) <= x["VWAP"].shift(1))
-    ] = 1
-    vwap.loc[
-        (close < x["VWAP"]) &
-        (close.shift(1) >= x["VWAP"].shift(1))
-    ] = -1
-
-    supertrend = pd.Series(0, index=x.index)
-    supertrend.loc[
-        (x["ST_DIRECTION"] == 1) &
-        (x["ST_DIRECTION"].shift(1) == -1)
-    ] = 1
-    supertrend.loc[
-        (x["ST_DIRECTION"] == -1) &
-        (x["ST_DIRECTION"].shift(1) == 1)
-    ] = -1
-
-    bull = (
-        (x["EMA9"] > x["EMA21"]).astype(int)
-        + (x["MACD"] > x["MACD_SIGNAL"]).astype(int)
-        + ((x["RSI"] > 50) & (x["RSI"] < 75)).astype(int)
-        + (close > x["VWAP"]).astype(int)
-        + (x["ST_DIRECTION"] == 1).astype(int)
+    selected_index = st.selectbox(
+        "Select Index",
+        list(SYMBOLS.keys())
     )
 
-    bear = (
-        (x["EMA9"] < x["EMA21"]).astype(int)
-        + (x["MACD"] < x["MACD_SIGNAL"]).astype(int)
-        + ((x["RSI"] < 50) & (x["RSI"] > 25)).astype(int)
-        + (close < x["VWAP"]).astype(int)
-        + (x["ST_DIRECTION"] == -1).astype(int)
+    selected_tf = st.selectbox(
+        "Select Timeframe",
+        list(INTERVALS.keys())
     )
 
-    combined = pd.Series(0, index=x.index)
-    combined.loc[(bull >= 4) & (bull > bear)] = 1
-    combined.loc[(bear >= 4) & (bear > bull)] = -1
-
-    return {
-        "EMA Crossover": ema,
-        "RSI Reversal": rsi,
-        "MACD Momentum": macd,
-        "VWAP Crossover": vwap,
-        "Supertrend": supertrend,
-        "Combined Strategy": combined
-    }
-
-
-# =====================================================
-# 6. BACKTEST ENGINE
-# =====================================================
-
-def run_backtest(
-    df,
-    signals,
-    sl_multiplier,
-    rr,
-    holding,
-    fee_bps,
-    slip_bps
-):
-    trades = []
-    position = None
-
-    for i in range(1, len(df)):
-        row = df.iloc[i]
-        signal = int(signals.iloc[i-1])
-
-        if position is None:
-            if signal == 0:
-                continue
-
-            entry = float(row["Open"])
-            atr = float(df["ATR"].iloc[i-1])
-
-            if not np.isfinite(entry) or not np.isfinite(atr):
-                continue
-
-            if entry <= 0 or atr <= 0:
-                continue
-
-            direction = signal
-            distance = sl_multiplier * atr
-
-            position = {
-                "direction": direction,
-                "entry": entry,
-                "sl": entry - direction * distance,
-                "target": entry + direction * distance * rr,
-                "entry_index": i,
-                "entry_time": df.index[i]
-            }
-            continue
-
-        direction = position["direction"]
-
-        stop_hit = (
-            float(row["Low"]) <= position["sl"]
-            if direction == 1
-            else float(row["High"]) >= position["sl"]
-        )
-
-        target_hit = (
-            float(row["High"]) >= position["target"]
-            if direction == 1
-            else float(row["Low"]) <= position["target"]
-        )
-
-        exit_price = None
-        exit_reason = None
-
-        # Conservative: SL wins if SL and target hit in same candle.
-        if stop_hit:
-            exit_price = position["sl"]
-            exit_reason = "Stop Loss"
-
-        elif target_hit:
-            exit_price = position["target"]
-            exit_reason = "Target"
-
-        elif i - position["entry_index"] >= holding:
-            exit_price = float(row["Close"])
-            exit_reason = "Time Exit"
-
-        if exit_price is not None:
-            entry = position["entry"]
-
-            gross = direction * (exit_price - entry) / entry
-            costs = 2 * (fee_bps + slip_bps) / 10000
-            net = gross - costs
-
-            trades.append({
-                "Entry Time": position["entry_time"],
-                "Exit Time": df.index[i],
-                "Direction": "LONG" if direction == 1 else "SHORT",
-                "Entry": entry,
-                "Exit": exit_price,
-                "Gross Return %": gross * 100,
-                "Net Return %": net * 100,
-                "Exit Reason": exit_reason,
-                "Result": "WIN" if net > 0 else "LOSS"
-            })
-
-            position = None
-
-    if position is not None:
-        row = df.iloc[-1]
-        exit_price = float(row["Close"])
-        entry = position["entry"]
-        direction = position["direction"]
-
-        gross = direction * (exit_price - entry) / entry
-        costs = 2 * (fee_bps + slip_bps) / 10000
-        net = gross - costs
-
-        trades.append({
-            "Entry Time": position["entry_time"],
-            "Exit Time": df.index[-1],
-            "Direction": "LONG" if direction == 1 else "SHORT",
-            "Entry": entry,
-            "Exit": exit_price,
-            "Gross Return %": gross * 100,
-            "Net Return %": net * 100,
-            "Exit Reason": "End of Data",
-            "Result": "WIN" if net > 0 else "LOSS"
-        })
-
-    if not trades:
-        return None
-
-    trade_df = pd.DataFrame(trades)
-    net = trade_df["Net Return %"]
-
-    wins = net[net > 0]
-    losses = net[net <= 0]
-
-    equity = (1 + net / 100).cumprod()
-    drawdown = (equity / equity.cummax() - 1) * 100
-
-    gross_profit = wins.sum()
-    gross_loss = abs(losses.sum())
-
-    profit_factor = (
-        gross_profit / gross_loss
-        if gross_loss > 0 else np.inf
+    show_simulation = st.checkbox(
+        "Monte Carlo Simulation",
+        value=True
     )
 
-    return {
-        "trades": trade_df,
-        "count": len(trade_df),
-        "win_rate": (net > 0).mean() * 100,
-        "net_return": (equity.iloc[-1] - 1) * 100,
-        "profit_factor": profit_factor,
-        "max_drawdown": abs(drawdown.min()),
-        "wins": int((net > 0).sum()),
-        "losses": int((net <= 0).sum())
-    }
+symbol = SYMBOLS[selected_index]
+interval, period = INTERVALS[selected_tf]
 
+# MARKET DATA
 
-# =====================================================
-# 7. MAIN LIVE SCANNER
-# =====================================================
+with st.spinner("Loading market data..."):
+    raw_df = download_data(symbol, interval, period)
 
-if st.button("🔄 REFRESH SCANNER"):
-    st.cache_data.clear()
-
-periods = {
-    "5 MIN": ("5m", "5d"),
-    "15 MIN": ("15m", "60d"),
-    "30 MIN": ("30m", "60d"),
-    "1 HOUR": ("60m", "730d")
-}
-
-results = {}
-
-with st.spinner("Analyzing Indian market data..."):
-    for name, (interval, period) in periods.items():
-        raw = get_data(interval, period)
-
-        if not raw.empty:
-            prepared = add_indicators(raw)
-            results[name] = analyze_market(prepared)
-
-if "5 MIN" not in results or "15 MIN" not in results:
-    st.error("Market data unavailable or insufficient.")
+if raw_df.empty or len(raw_df) < 60:
+    st.error("Market data unavailable. Please try another timeframe or index.")
     st.stop()
 
-st.subheader("📊 MULTI-TIMEFRAME ANALYSIS")
+df = add_indicators(raw_df)
 
-cols = st.columns(4)
+if df.empty:
+    st.error("Not enough candles to calculate indicators.")
+    st.stop()
 
-for col, name in zip(cols, periods):
-    with col:
-        result = results.get(name)
-        st.markdown(f"### {name}")
+result = signal_for(df)
 
-        if result is None:
-            st.warning("Data unavailable")
-            continue
+price_change = df["Close"].iloc[-1] - df["Close"].iloc[-2]
+change_pct = price_change / df["Close"].iloc[-2] * 100
 
-        st.metric("NIFTY Spot", f'{result["price"]:,.2f}')
-        st.metric("Signal", result["signal"])
-        st.metric("Bullish Score", f'{result["bull"]}/100')
-        st.metric("Bearish Score", f'{result["bear"]}/100')
-        st.metric("RSI", f'{result["rsi"]:.1f}')
-        st.metric("ADX", f'{result["adx"]:.1f}')
+# MAIN DASHBOARD
 
-# =====================================================
-# 8. SCENARIO ANALYSIS
-# =====================================================
+st.subheader("📊 Market Overview")
 
-st.divider()
-st.subheader("🧠 30,000 SCENARIO ANALYSIS")
+c1, c2, c3, c4 = st.columns(4)
 
-simulation = simulate_scenarios(
-    results["15 MIN"]["df"]
+c1.metric(
+    "Latest Price",
+    f"{result['price']:,.2f}",
+    f"{change_pct:+.2f}%"
 )
 
-if simulation:
+c2.metric(
+    "Market Signal",
+    result["signal"],
+    f"Score {result['score']}/5"
+)
+
+c3.metric("RSI 14", f"{result['rsi']:.2f}")
+
+c4.metric("ATR", f"{result['atr']:.2f}")
+
+# TRADE SETUP
+
+st.subheader("🎯 Trading Strategy")
+
+if result["signal"] == "WAIT / SIDEWAYS":
+    st.warning("No clear entry. Wait for confirmation.")
+
+else:
     a, b, c = st.columns(3)
 
-    a.metric(
-        "Bullish Scenarios",
-        f'{simulation["bullish"]:,}',
-        f'{simulation["bull_pct"]:.1f}%'
+    a.metric("Stop Loss", f"{result['sl']:,.2f}")
+    b.metric("Target 1", f"{result['target1']:,.2f}")
+    c.metric("Target 2", f"{result['target2']:,.2f}")
+
+    st.caption("ATR-based indicative index levels, not option premiums.")
+
+with st.expander("Signal Explanation"):
+    for reason in result["reasons"]:
+        st.write("• " + reason)
+
+# CHARTS
+
+st.subheader("📈 Price Chart")
+
+chart_data = df[
+    ["Close", "EMA9", "EMA21", "EMA50", "VWAP"]
+].tail(250)
+
+st.line_chart(chart_data, use_container_width=True)
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.write("RSI Indicator")
+    st.line_chart(df[["RSI"]].tail(250))
+
+with col2:
+    st.write("MACD Indicator")
+    st.line_chart(
+        df[["MACD", "MACD_signal"]].tail(250)
     )
 
-    b.metric(
-        "Bearish Scenarios",
-        f'{simulation["bearish"]:,}',
-        f'{simulation["bear_pct"]:.1f}%'
-    )
+# MULTI TIMEFRAME
 
-    c.metric(
-        "Sideways Scenarios",
-        f'{simulation["sideways"]:,}',
-        f'{simulation["side_pct"]:.1f}%'
-    )
+st.subheader("🧭 Multi-Timeframe Analysis")
 
-    st.caption(
-        "Historical bootstrap simulation. Scenario shares are not "
-        "calibrated probabilities of future market movement."
-    )
-else:
-    st.warning("Insufficient data for scenario analysis.")
+timeframe_rows = []
 
-# =====================================================
-# 9. FINAL CONFIRMATION
-# =====================================================
+for tf_name, (tf_interval, tf_period) in INTERVALS.items():
 
-st.divider()
-st.subheader("🎯 FINAL DEEP ANALYSIS")
+    try:
+        tf_raw = download_data(
+            symbol,
+            tf_interval,
+            tf_period
+        )
 
-available = [
-    r for r in results.values()
-    if r is not None
-]
+        if len(tf_raw) < 60:
+            timeframe_rows.append({
+                "Timeframe": tf_name,
+                "Signal": "Insufficient data",
+                "RSI": "—"
+            })
+            continue
 
-bull_count = sum(
-    r["signal"] == "CALL BIAS" for r in available
+        tf_df = add_indicators(tf_raw)
+        tf_signal = signal_for(tf_df)
+
+        timeframe_rows.append({
+            "Timeframe": tf_name,
+            "Signal": tf_signal["signal"],
+            "RSI": round(tf_signal["rsi"], 2),
+            "Price": round(tf_signal["price"], 2)
+        })
+
+    except Exception:
+        timeframe_rows.append({
+            "Timeframe": tf_name,
+            "Signal": "Data error",
+            "RSI": "—"
+        })
+
+st.dataframe(
+    pd.DataFrame(timeframe_rows),
+    use_container_width=True,
+    hide_index=True
 )
 
-bear_count = sum(
-    r["signal"] == "PUT BIAS" for r in available
+# BACKTEST
+
+st.subheader("🧪 Historical Backtesting")
+
+bt_result = run_backtest(df)
+
+m1, m2, m3, m4 = st.columns(4)
+
+m1.metric("Strategy Return", f"{bt_result['return']:.2f}%")
+m2.metric("Buy & Hold", f"{bt_result['buy_hold']:.2f}%")
+m3.metric("Winning Bars", f"{bt_result['win_rate']:.2f}%")
+m4.metric("Maximum Drawdown", f"{bt_result['max_drawdown']:.2f}%")
+
+st.line_chart(
+    bt_result["data"][["Equity", "Buy_Hold"]].tail(500)
 )
 
-higher = [
-    results.get("30 MIN"),
-    results.get("1 HOUR")
-]
+st.caption(
+    "Simplified historical simulation. Brokerage, taxes, slippage "
+    "and option pricing are excluded."
+)
 
-call_confirm = (
-    bull_count >= 3
-    and results["15 MIN"]["signal"] == "CALL BIAS"
-    and any(
-        x is not None and x["signal"] == "CALL BIAS"
-        for x in higher
+# MONTE CARLO
+
+if show_simulation:
+
+    st.subheader("🎲 Monte Carlo Analysis")
+
+    with st.spinner("Running 30,000 simulations..."):
+        mc = monte_carlo_projection(
+            df,
+            simulations=30000,
+            steps=20
+        )
+
+    if mc is None:
+        st.warning("Not enough historical data.")
+
+    else:
+        x1, x2, x3, x4 = st.columns(4)
+
+        x1.metric("10th Percentile", f"{mc['p10']:,.2f}")
+        x2.metric("Median Scenario", f"{mc['p50']:,.2f}")
+        x3.metric("90th Percentile", f"{mc['p90']:,.2f}")
+        x4.metric("Simulated Up Probability", f"{mc['up_probability']:.2f}%")
+
+        st.caption(
+            "Historical resampling scenarios are not guaranteed forecasts."
+        )
+
+# DATA TABLE
+
+with st.expander("View Latest Market Data"):
+    st.dataframe(
+        df.tail(30).sort_index(ascending=False),
+        use_container_width=True
     )
-    and simulation is not None
-    and simulation["bull_pct"] >= 55
-)
 
-put_confirm = (
-    bear_count >= 3
-    and results["15 MIN"]["signal"] == "PUT BIAS"
-    and any(
-        x is not None and x["signal"] == "PUT BIAS"
-        for x in higher
+st.caption(
+    "Data source: Yahoo Finance via yfinance. "
+    "Educational analysis only. No trades are executed."
     )
-    and simulation is not None
-    and simulation["bear_pct"] >= 55
-)
-
-if call_confirm:
-    final = "CALL BIAS"
-    st.success("FINAL RESULT: STRONG CALL BIAS")
-
-elif put_confirm:
-    final = "PUT BIAS"
-    st.error("FINAL RESULT: STRONG PUT BIAS")
-
-else:
-    final = "NO TRADE"
-    st.warning("NO TRADE — CONDITIONS NOT CONFIRMED")
-
-st.metric(
-    "Bullish Timeframe Confirmations",
-    f"{bull_count}/{len(available)}"
-)
-
-st.metric(
-    "Bearish Timeframe 
