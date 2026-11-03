@@ -1,9 +1,6 @@
-with st.sidebar:
-    st.subheader("Dashboard Controls")
 
-    if st.button("🔄 Refresh Data", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
+
+
 # ============================================================
 # NIFTY AI ULTIMATE DASHBOARD
 # PART 1 OF 2
@@ -45,7 +42,12 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+import streamlit as st
 
+st.set_page_config(
+    page_title="NIFTY 50 AI Dashboard",
+    layout="wide"
+)
 # ============================================================
 # 2. CUSTOM CSS
 # ============================================================
