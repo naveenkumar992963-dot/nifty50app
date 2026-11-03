@@ -215,6 +215,15 @@ def live_dashboard():
 
     # -------------------- INDICATORS --------------------
     def resample_ohlcv(raw, minutes):
+        # Upstox payloads can occasionally arrive with object/string dtypes.
+        # Normalize OHLCV before pandas aggregation (especially Volume.sum).
+        raw = raw.copy()
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            if col in raw.columns:
+                raw[col] = pd.to_numeric(raw[col], errors="coerce")
+        if "Volume" not in raw.columns:
+            raw["Volume"] = 0.0
+        raw["Volume"] = raw["Volume"].fillna(0.0).astype("float64")
         out = raw.resample(f"{minutes}min", origin="start_day", offset="15min").agg(
             {"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna(subset=["Open","High","Low","Close"])
         now = pd.Timestamp.now(tz="Asia/Kolkata")
@@ -224,6 +233,14 @@ def live_dashboard():
 
     def indicators(data):
         d = data.copy()
+        # Ensure numeric dtypes before rolling/ewm/cumsum calculations.
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            if col in d.columns:
+                d[col] = pd.to_numeric(d[col], errors="coerce")
+        if "Volume" not in d.columns:
+            d["Volume"] = 0.0
+        d["Volume"] = d["Volume"].fillna(0.0).astype("float64")
+        d = d.dropna(subset=["Open", "High", "Low", "Close"])
         c,h,l = d.Close,d.High,d.Low
         d["EMA9"] = c.ewm(span=9,adjust=False).mean()
         d["EMA21"] = c.ewm(span=21,adjust=False).mean()
@@ -489,7 +506,8 @@ def live_dashboard():
         agreement=sum(weights[k] for k,v in scores.items() if (v>0 and final_score>0) or (v<0 and final_score<0))
         confidence=clamp(abs(final_score)*0.75+agreement*0.25,0,1)*100
         return scores,weights,final_score,confidence
-        # -------------------- FETCH & PROCESS --------------------
+
+    # -------------------- FETCH & PROCESS --------------------
     try:
         now=datetime.now(IST)
         from_date=(now.date()-timedelta(days=25)).isoformat()
@@ -555,8 +573,7 @@ def live_dashboard():
         st.error(f"Data / API error: {e}")
         st.info("Secrets में UPSTOX_ACCESS_TOKEN और UPSTOX_INSTRUMENT_KEY = NSE_INDEX|Nifty 50 जाँचें. Option chain API access भी आवश्यक है.")
         st.stop()
-
-    # -------------------- OVERVIEW --------------------
+        # -------------------- OVERVIEW --------------------
     st.divider()
     st.subheader("Market Snapshot")
     c=st.columns(5)
@@ -688,7 +705,9 @@ def live_dashboard():
     else:
         st.subheader("Final Option Trade Plan")
         st.info("NO TRADE or no valid option contract: CE/PE, premium entry, SL, targets and R:R are withheld.")
-# -------------------- LEVELS & RISK --------------------
+
+
+    # -------------------- LEVELS & RISK --------------------
     st.divider()
     st.subheader("Risk & Index Levels (Research only)")
     entry=spot
@@ -787,8 +806,7 @@ def live_dashboard():
         b.metric("Profit factor",f"{pf:.2f}" if np.isfinite(pf) else "N/A")
         c.metric("Closed trades",str(total))
     else: st.info("No closed paper trades yet.")
-
-    # -------------------- BACKTEST (SIMPLE, NON-OVERLAPPING SIGNAL STUDY) --------------------
+        # -------------------- BACKTEST (SIMPLE, NON-OVERLAPPING SIGNAL STUDY) --------------------
     st.divider()
     st.subheader("Historical Signal Study (5-minute bars)")
     st.caption("A simple chronological, non-overlapping research simulation using trend filters. Excludes brokerage, slippage and taxes; not a live execution backtest.")
@@ -804,7 +822,8 @@ def live_dashboard():
         st.write(f"Signals: **{len(active)}** | Hit ratio: **{wins/len(active)*100:.1f}%** | Mean return per signal: **{active.strategy_ret.mean()*100:.3f}%**")
         st.caption("Signals can overlap and use close-to-close returns; this is a screening study, not a fully costed portfolio backtest.")
     else: st.info("Historical signal sample अभी पर्याप्त नहीं है.")
-        # -------------------- CHARTS --------------------
+
+    # -------------------- CHARTS --------------------
     st.divider()
     st.subheader("NIFTY 3-minute Price & Indicators")
     fig=go.Figure()
@@ -837,4 +856,3 @@ def live_dashboard():
 
 
 live_dashboard()
-
