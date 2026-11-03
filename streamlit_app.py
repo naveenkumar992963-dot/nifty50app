@@ -373,7 +373,7 @@ try:
 # FINAL SIGNAL WITH MOMENTUM CONFIRMATION
 # ==========================================
 
-signal, reasons = final_signal(a3, a5, a15)
+
 
 # RSI confirmation
 rsi_values = [
