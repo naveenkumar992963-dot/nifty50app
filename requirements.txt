@@ -1,9 +1,5 @@
-
 streamlit
 pandas
 numpy
 yfinance
-requests
-feedparser
 plotly
-scikit-learn
