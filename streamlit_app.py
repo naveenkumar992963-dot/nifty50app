@@ -1,6 +1,7 @@
 # NIFTY 50 Institutional-Style AI Research & Paper Trading Dashboard
 # Research/education only. No broker order-placement endpoints are used.
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import numpy as np
 import requests
@@ -483,8 +484,7 @@ if not chain.empty and signal in ("BUY","SELL"):
         st.info("Directional signal मिला, लेकिन usable CE/PE contract data नहीं मिला.")
 else:
     st.info("Option candidate तभी बनेगा जब NIFTY directional signal और usable option chain दोनों उपलब्ध हों.")
-    
-# -------------------- LEVELS & RISK --------------------
+    # -------------------- LEVELS & RISK --------------------
 st.divider()
 st.subheader("Risk & Index Levels (Research only)")
 entry=spot
