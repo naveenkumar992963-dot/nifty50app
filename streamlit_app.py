@@ -1,342 +1,499 @@
-
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import date, timedelta
-from src.upstox_client import UpstoxClient, UpstoxError
-from src.strategy import build_signal, choose_option
-from src.backtest import run_backtest
+from math import ceil
+
+# ---------------- PAGE SETTINGS ----------------
 
 st.set_page_config(
-    page_title="NIFTY 50 AI Trading Intelligence",
-    page_icon="📊",
+    page_title="NIFTY 50 PRO",
+    page_icon="📈",
     layout="wide"
 )
 
-st.title("📊 NIFTY 50 AI Trading Intelligence")
-st.caption("Upstox Live Data | Options Buying | CE / PE Signals")
+st.title("📈 NIFTY 50 PRO PREDICTION")
+st.caption("Multi-Timeframe | EMA | RSI | MACD | VWAP | Supertrend")
 
-with st.sidebar:
-    st.header("Connection Settings")
+# ---------------- DATA FETCH ----------------
 
-    token = st.text_input(
-        "Upstox Access Token",
-        type="password"
+@st.cache_data(ttl=60)
+def get_data(interval, period):
+    df = yf.download(
+        "^NSEI",
+        period=period,
+        interval=interval,
+        progress=False,
+        auto_adjust=False,
+        threads=False
     )
 
-    timeframe = st.selectbox(
-        "Timeframe",
-        [1, 3, 5, 15],
-        index=2
+    if df.empty:
+        return pd.DataFrame()
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    needed = ["Open", "High", "Low", "Close"]
+    if not all(c in df.columns for c in needed):
+        return pd.DataFrame()
+
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        if col not in df.columns:
+            df[col] = 0
+
+    return df.dropna(subset=needed).copy()
+
+
+# ---------------- INDICATORS ----------------
+
+def calculate_indicators(df):
+
+    df = df.copy()
+
+    close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
+
+    # EMA
+    df["EMA9"] = close.ewm(span=9, adjust=False).mean()
+    df["EMA21"] = close.ewm(span=21, adjust=False).mean()
+    df["EMA200"] = close.ewm(span=200, adjust=False).mean()
+
+    # RSI
+    delta = close.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(
+        alpha=1/14, min_periods=14, adjust=False
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1/14, min_periods=14, adjust=False
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    # MACD
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+
+    df["MACD"] = ema12 - ema26
+    df["MACD_SIGNAL"] = df["MACD"].ewm(
+        span=9, adjust=False
+    ).mean()
+
+    # ATR
+    prev_close = close.shift(1)
+
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+
+    df["ATR"] = tr.ewm(
+        alpha=1/14, adjust=False
+    ).mean()
+
+    # SUPERTREND
+    period = 10
+    factor = 3.0
+
+    basic_upper = (
+        (high + low) / 2
+    ) + factor * df["ATR"]
+
+    basic_lower = (
+        (high + low) / 2
+    ) - factor * df["ATR"]
+
+    final_upper = basic_upper.copy()
+    final_lower = basic_lower.copy()
+
+    st_direction = pd.Series(
+        1, index=df.index, dtype=int
     )
 
-    expiry = st.date_input(
-        "Option Expiry",
-        value=date.today() + timedelta(days=7)
-    )
+    for i in range(1, len(df)):
 
-    capital = st.number_input(
-        "Trading Capital ₹",
-        min_value=1000,
-        value=25000,
-        step=1000
-    )
+        if (
+            basic_upper.iloc[i] < final_upper.iloc[i-1]
+            or close.iloc[i-1] > final_upper.iloc[i-1]
+        ):
+            final_upper.iloc[i] = basic_upper.iloc[i]
+        else:
+            final_upper.iloc[i] = final_upper.iloc[i-1]
 
-    risk = st.slider(
-        "Risk per Trade %",
-        0.25,
-        2.0,
-        0.5,
-        0.25
-    )
+        if (
+            basic_lower.iloc[i] > final_lower.iloc[i-1]
+            or close.iloc[i-1] < final_lower.iloc[i-1]
+        ):
+            final_lower.iloc[i] = basic_lower.iloc[i]
+        else:
+            final_lower.iloc[i] = final_lower.iloc[i-1]
 
-if not token:
-    st.info("Upstox Access Token sidebar mein enter karein.")
+        if close.iloc[i] > final_upper.iloc[i-1]:
+            st_direction.iloc[i] = 1
 
-    st.markdown("""
-    ### Upstox API Setup
+        elif close.iloc[i] < final_lower.iloc[i-1]:
+            st_direction.iloc[i] = -1
 
-    1. https://account.upstox.com/developer/apps kholo.
-    2. Login karo.
-    3. Developer App create karo.
-    4. Official process se Access Token generate karo.
-    5. Token sidebar mein paste karo.
+        else:
+            st_direction.iloc[i] = st_direction.iloc[i-1]
 
-    Apna API Secret ya Access Token kisi ke saath share mat karna.
-    """)
-    st.stop()
+    df["ST_DIRECTION"] = st_direction
 
-client = UpstoxClient(token)
+    # VWAP - session based
+    volume = df["Volume"].fillna(0)
+
+    typical_price = (high + low + close) / 3
+
+    if volume.sum() > 0:
+
+        session = pd.Series(
+            df.index.date, index=df.index
+        )
+
+        pv = typical_price * volume
+
+        df["VWAP"] = (
+            pv.groupby(session).cumsum()
+            / volume.groupby(session).cumsum().replace(0, np.nan)
+        )
+
+    else:
+        df["VWAP"] = np.nan
+
+    # Volume confirmation
+    df["VOL_AVG"] = volume.rolling(20).mean()
+
+    return df
+
+
+# ---------------- MARKET DATA ----------------
 
 try:
-    with st.spinner("Live NIFTY data load ho raha hai..."):
 
-        candles = client.intraday_candles(
-            "NSE_INDEX|Nifty 50",
-            timeframe
-        )
-
-        if len(candles) < 60:
-            historical = client.historical_candles(
-                "NSE_INDEX|Nifty 50",
-                timeframe,
-                90
-            )
-
-            if not historical.empty:
-                candles = pd.concat(
-                    [historical, candles]
-                ).drop_duplicates(
-                    "timestamp"
-                ).sort_values(
-                    "timestamp"
-                ).reset_index(drop=True)
-
-        chain = client.option_chain(
-            "NSE_INDEX|Nifty 50",
-            expiry.isoformat()
-        )
-
-except UpstoxError as error:
-    st.error("Upstox API Error")
-    st.code(str(error))
-    st.stop()
-
-except Exception as error:
-    st.error("Data loading error")
-    st.code(str(error))
-    st.stop()
-
-if candles.empty:
-    st.error("NIFTY candle data available nahi hai.")
-    st.stop()
-
-if not chain:
-    st.error("Option Chain data available nahi hai.")
-    st.stop()
-
-spot_prices = [
-    item.get("underlying_spot_price")
-    for item in chain
-    if item.get("underlying_spot_price") is not None
-]
-
-spot = (
-    float(spot_prices[0])
-    if spot_prices
-    else float(candles.iloc[-1]["close"])
-)
-
-result = build_signal(candles, chain)
-
-signal = result["signal"]
-
-option = None
-
-if signal in ["BUY CE", "BUY PE"]:
-    option = choose_option(
-        chain,
-        signal,
-        spot
+    df5 = calculate_indicators(
+        get_data("5m", "5d")
     )
 
-st.divider()
+    df15 = calculate_indicators(
+        get_data("15m", "5d")
+    )
 
-st.subheader("MARKET OVERVIEW")
+    df60 = calculate_indicators(
+        get_data("60m", "1mo")
+    )
 
-c1, c2, c3, c4 = st.columns(4)
+    if any(x.empty for x in [df5, df15, df60]):
+        st.error("Market data unavailable. Please refresh.")
+        st.stop()
 
-c1.metric(
-    "NIFTY 50",
-    f"₹{spot:,.2f}"
-)
+    current = df5.iloc[-1]
+    candle15 = df15.iloc[-1]
+    candle60 = df60.iloc[-1]
 
-c2.metric(
-    "Market Regime",
-    result["regime"]
-)
+    price = float(current["Close"])
+    atr = float(current["ATR"])
+    rsi = float(current["RSI"])
 
-c3.metric(
-    "AI Setup Score",
-    f'{result["score"]}/100'
-)
+    if not np.isfinite(atr) or atr <= 0:
+        st.error("ATR data not available.")
+        st.stop()
 
-c4.metric(
-    "RSI",
-    str(result["indicators"].get("RSI"))
-)
+    # ---------------- TREND SCORE ----------------
 
-st.divider()
+    buy_score = 0
+    sell_score = 0
 
-st.subheader("FINAL TRADING SIGNAL")
+    details = []
 
-if signal == "BUY CE":
-    st.success("🟢 BUY CE")
+    # EMA 9 / 21 / 200
+    if (
+        current["EMA9"] > current["EMA21"]
+        and current["EMA21"] > current["EMA200"]
+    ):
+        buy_score += 2
+        details.append(("EMA Trend", "Bullish"))
 
-elif signal == "BUY PE":
-    st.error("🔴 BUY PE")
+    elif (
+        current["EMA9"] < current["EMA21"]
+        and current["EMA21"] < current["EMA200"]
+    ):
+        sell_score += 2
+        details.append(("EMA Trend", "Bearish"))
 
-else:
-    st.warning("🟡 NO TRADE")
-
-st.write(result["summary"])
-
-st.subheader("AI Confirmation")
-
-for reason in result["reasons"]:
-    if reason["passed"]:
-        st.write("✅", reason["text"])
     else:
-        st.write("▫️", reason["text"])
+        details.append(("EMA Trend", "Mixed"))
 
-st.divider()
+    # RSI
+    if 52 <= rsi < 70:
+        buy_score += 1
+        details.append(("RSI", "Bullish"))
 
-st.subheader("TECHNICAL INDICATORS")
+    elif 30 < rsi <= 48:
+        sell_score += 1
+        details.append(("RSI", "Bearish"))
 
-st.json(result["indicators"])
+    else:
+        details.append(("RSI", "Neutral"))
 
-if option:
+    # MACD
+    if current["MACD"] > current["MACD_SIGNAL"]:
+        buy_score += 1
+        details.append(("MACD", "Bullish"))
 
-    premium = float(option["ltp"])
+    elif current["MACD"] < current["MACD_SIGNAL"]:
+        sell_score += 1
+        details.append(("MACD", "Bearish"))
 
-    stop_loss = premium * 0.80
-    target1 = premium * 1.30
-    target2 = premium * 1.60
+    # Supertrend
+    if current["ST_DIRECTION"] == 1:
+        buy_score += 1
+        details.append(("Supertrend", "Bullish"))
 
-    risk_amount = capital * risk / 100
+    else:
+        sell_score += 1
+        details.append(("Supertrend", "Bearish"))
 
-    quantity = int(
-        risk_amount / max(premium - stop_loss, 0.01)
-    )
+    # VWAP
+    vwap = current["VWAP"]
 
-    st.subheader("SELECTED OPTION")
+    if pd.notna(vwap):
+        if price > vwap:
+            buy_score += 1
+            details.append(("VWAP", "Bullish"))
+        elif price < vwap:
+            sell_score += 1
+            details.append(("VWAP", "Bearish"))
 
-    a, b, c, d = st.columns(4)
+    # Volume confirmation
+    vol = current["Volume"]
+    vol_avg = current["VOL_AVG"]
 
-    a.metric(
-        "Strike",
-        f'{option["strike"]} {option["side"]}'
-    )
+    if (
+        pd.notna(vol_avg)
+        and vol_avg > 0
+        and vol > vol_avg
+    ):
+        if current["Close"] > current["Open"]:
+            buy_score += 1
+            details.append(("Volume", "Bullish"))
+        elif current["Close"] < current["Open"]:
+            sell_score += 1
+            details.append(("Volume", "Bearish"))
 
-    b.metric(
-        "Premium",
-        f"₹{premium:.2f}"
-    )
+    # 15m confirmation
+    if candle15["EMA9"] > candle15["EMA21"]:
+        buy_score += 1
+        details.append(("15m Trend", "Bullish"))
+    else:
+        sell_score += 1
+        details.append(("15m Trend", "Bearish"))
 
-    c.metric(
-        "Indicative SL",
-        f"₹{stop_loss:.2f}"
-    )
+    # 1h confirmation
+    if candle60["EMA9"] > candle60["EMA21"]:
+        buy_score += 1
+        details.append(("1H Trend", "Bullish"))
+    else:
+        sell_score += 1
+        details.append(("1H Trend", "Bearish"))
 
-    d.metric(
-        "Target 1",
-        f"₹{target1:.2f}"
-    )
+    # Available maximum score
+    max_score = 2 + 1 + 1 + 1 + 1 + 1
+
+    if pd.notna(vwap):
+        max_score += 1
+
+    if pd.notna(vol_avg) and vol_avg > 0:
+        max_score += 1
+
+    # Prediction threshold
+    threshold = ceil(max_score * 0.70)
+
+    if (
+        buy_score >= threshold
+        and buy_score - sell_score >= 2
+    ):
+        signal = "STRONG BUY"
+
+    elif (
+        sell_score >= threshold
+        and sell_score - buy_score >= 2
+    ):
+        signal = "STRONG SELL"
+
+    else:
+        signal = "NO TRADE"
+
+    confidence = (
+        max(buy_score, sell_score) / max_score
+    ) * 100
+
+    # ---------------- DASHBOARD ----------------
+
+    st.divider()
+
+    c1, c2, c3 = st.columns(3)
+
+    c1.metric("NIFTY 50 PRICE", f"{price:,.2f}")
+    c2.metric("RSI 14", f"{rsi:.2f}")
+    c3.metric("ATR 14", f"{atr:.2f}")
+
+    st.divider()
+
+    st.subheader("🤖 STRATEGY PREDICTION")
+
+    if signal == "STRONG BUY":
+        st.success("🟢 STRONG BUY")
+
+    elif signal == "STRONG SELL":
+        st.error("🔴 STRONG SELL")
+
+    else:
+        st.warning("🟡 NO TRADE - WAIT")
 
     st.metric(
-        "Target 2",
-        f"₹{target2:.2f}"
+        "Indicator Agreement Score (not probability)",
+        f"{confidence:.1f}%"
     )
 
     st.write(
-        f"Risk Budget: ₹{risk_amount:.2f}"
+        f"BUY Score: {buy_score}/{max_score}"
     )
 
     st.write(
-        f"Indicative Quantity: {quantity} units"
+        f"SELL Score: {sell_score}/{max_score}"
     )
 
-    st.write(
-        "Lot size aur actual margin Upstox mein verify karein."
+    st.progress(
+        min(1.0, confidence / 100)
     )
 
-    if option.get("spread_pct") is not None:
-        if option["spread_pct"] > 2.5:
-            st.warning(
-                "Bid-Ask spread high hai. Trade avoid karne par vichar karein."
-            )
+    st.divider()
 
-else:
-    st.info(
-        "Abhi qualified trade nahi hai. NO TRADE ka matlab wait karna hai."
-    )
-
-st.divider()
-
-st.subheader("LIVE OPTION CHAIN")
-
-option_table = pd.DataFrame(
-    result["option_rows"]
-)
-
-if not option_table.empty:
-
-    option_table["distance"] = abs(
-        option_table["strike"] - spot
-    )
+    st.subheader("📊 Indicator Confirmation")
 
     st.dataframe(
-        option_table.sort_values(
-            "distance"
-        ).head(30),
+        pd.DataFrame(
+            details,
+            columns=["Indicator", "Direction"]
+        ),
         use_container_width=True,
         hide_index=True
     )
 
-st.divider()
+    # ---------------- ENTRY / SL / TARGETS ----------------
 
-st.subheader("NIFTY PRICE CHART")
+    st.divider()
 
-chart = result["chart"]
+    st.subheader("🎯 TRADE LEVEL CALCULATOR")
 
-st.line_chart(
-    chart.set_index("timestamp")[
-        ["close", "ema9", "ema21", "ema50"]
-    ].tail(250)
-)
-
-st.divider()
-
-st.subheader("BACKTEST DIAGNOSTICS")
-
-backtest = run_backtest(candles)
-
-if backtest:
-
-    x, y, z = st.columns(3)
-
-    x.metric(
-        "Directional Hit Rate",
-        f'{backtest["hit_rate"]:.1f}%'
+    trade_mode = st.radio(
+        "Trade Side",
+        ["Use Strategy Signal", "Manual BUY", "Manual SELL"],
+        horizontal=True
     )
 
-    y.metric(
-        "Tested Signals",
-        backtest["trades"]
+    if trade_mode == "Use Strategy Signal":
+
+        trade_side = signal
+
+    elif trade_mode == "Manual BUY":
+
+        trade_side = "BUY"
+
+    else:
+
+        trade_side = "SELL"
+
+    if trade_side in ["STRONG BUY", "BUY"]:
+
+        entry = price
+        sl = entry - (atr * 1.2)
+
+        risk = entry - sl
+
+        target1 = entry + risk
+        target2 = entry + (risk * 2)
+        target3 = entry + (risk * 3)
+
+    elif trade_side in ["STRONG SELL", "SELL"]:
+
+        entry = price
+        sl = entry + (atr * 1.2)
+
+        risk = sl - entry
+
+        target1 = entry - risk
+        target2 = entry - (risk * 2)
+        target3 = entry - (risk * 3)
+
+    else:
+
+        entry = sl = target1 = target2 = target3 = None
+
+    if entry is not None:
+
+        a, b = st.columns(2)
+
+        a.metric("ENTRY", f"{entry:,.2f}")
+        b.metric("STOP LOSS", f"{sl:,.2f}")
+
+        x, y, z = st.columns(3)
+
+        x.metric("TARGET 1 (1R)", f"{target1:,.2f}")
+        y.metric("TARGET 2 (2R)", f"{target2:,.2f}")
+        z.metric("TARGET 3 (3R)", f"{target3:,.2f}")
+
+        st.info(
+            "Levels are ATR-based estimates, not guaranteed execution prices."
+        )
+
+    else:
+
+        st.info("No trade setup. Wait for stronger confirmation.")
+
+    # ---------------- CHART ----------------
+
+    st.divider()
+
+    st.subheader("📈 NIFTY 50 PRICE CHART")
+
+    st.line_chart(
+        df5[["Close", "EMA9", "EMA21"]].tail(100)
     )
 
-    z.metric(
-        "Max Drawdown",
-        f'{backtest["max_drawdown_points"]:.2f}'
+    with st.expander("Recent Market Data"):
+        st.dataframe(
+            df5[
+                ["Open", "High", "Low", "Close",
+                 "RSI", "MACD", "ATR"]
+            ].tail(20),
+            use_container_width=True
+        )
+
+    st.caption(
+        "Data source: Yahoo Finance. Intraday data may be delayed. "
+        "The latest candle may still be forming."
     )
 
-else:
+except Exception as e:
+
+    st.error(f"Application Error: {e}")
+
     st.info(
-        "Backtest ke liye aur historical candles chahiye."
+        "Refresh the app, check internet connection "
+        "and verify that all required libraries are installed."
     )
 
-st.warning("""
-IMPORTANT RISK NOTICE:
-
-- Ye rule-based decision-support engine hai, trained ML model nahi.
-- Setup score profit ki probability nahi hai.
-- Option SL aur targets indicative estimates hain.
-- Historical options premium backtesting abhi zaroori hai.
-- Brokerage, slippage, IV aur Theta ka impact hota hai.
-- Pehle paper trading karein.
-- App automatic orders execute nahi karta.
-""")
-
-st.caption(
-    "Data Source: Upstox API | NIFTY 50 Only"
+st.warning(
+    "Risk Warning: This is an experimental indicator-based tool, "
+    "not a guaranteed prediction system. A score is not a probability "
+    "of profit. Backtest and paper trade before using real money."
 )
