@@ -5,106 +5,143 @@ import numpy as np
 import yfinance as yf
 import plotly.graph_objects as go
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 st.set_page_config(
-    page_title="NIFTY 50 AI Trading Dashboard",
+    page_title="NIFTY Multi-Timeframe AI",
     page_icon="📈",
     layout="wide"
 )
 
-st.title("📈 NIFTY 50 AI Trading Dashboard")
-st.caption("EMA + RSI + MACD + Supertrend | 5m / 15m")
+st.title("📈 NIFTY 50 Multi-Timeframe Trading System")
+st.caption("3M + 5M + 15M | One Final Signal | ATR Risk Management")
 
-# ---------------- SIDEBAR ----------------
+# ---------------- SETTINGS ----------------
 
 with st.sidebar:
-    st.header("Dashboard Controls")
-
-    timeframe = st.selectbox(
-        "Select Timeframe",
-        ["5m", "15m"]
-    )
+    st.header("Dashboard Settings")
 
     capital = st.number_input(
-        "Your Trading Capital (₹)",
+        "Trading Capital (₹)",
         min_value=1000,
         value=10000,
         step=1000
     )
 
     risk_percent = st.slider(
-        "Risk per Trade (%)",
-        min_value=0.5,
-        max_value=2.0,
-        value=1.0,
-        step=0.5
+        "Risk per trade (%)",
+        0.5, 2.0, 1.0, 0.5
     )
 
-    refresh = st.button(
-        "🔄 REFRESH DATA",
-        use_container_width=True
-    )
+    st.divider()
 
-    if refresh:
+    if st.button("🔄 REFRESH DATA", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
-    st.divider()
-    st.caption("Data source: Yahoo Finance")
-    st.caption("Data may be delayed.")
+    st.caption("Source: Yahoo Finance")
+    st.caption("Market data may be delayed.")
 
-# ---------------- DATA ----------------
+# ---------------- DOWNLOAD ----------------
 
 @st.cache_data(ttl=60)
-def get_data(interval):
-    period = "5d" if interval == "5m" else "1mo"
-
-    df = yf.download(
+def download_data():
+    data = yf.download(
         "^NSEI",
-        period=period,
-        interval=interval,
+        period="5d",
+        interval="1m",
         progress=False,
         auto_adjust=False
     )
 
-    if df is None or df.empty:
+    if data is None or data.empty:
         return pd.DataFrame()
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
 
     required = ["Open", "High", "Low", "Close", "Volume"]
 
-    if not all(c in df.columns for c in required):
+    if not all(c in data.columns for c in required):
         return pd.DataFrame()
 
-    df = df[required].copy()
-    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    data = data[required].copy()
+    data = data.dropna(subset=["Open", "High", "Low", "Close"])
 
-    return df
+    if data.index.tz is None:
+        data.index = data.index.tz_localize("UTC")
+
+    data.index = data.index.tz_convert("Asia/Kolkata")
+
+    return data
+
+# ---------------- RESAMPLE ----------------
+
+def make_timeframe(data, minutes):
+    result = data.resample(
+        f"{minutes}min",
+        origin="start_day",
+        offset="15min"
+    ).agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum"
+    })
+
+    result = result.dropna(
+        subset=["Open", "High", "Low", "Close"]
+    )
+
+    # Remove incomplete latest candle
+    now = pd.Timestamp.now(tz="Asia/Kolkata")
+    if len(result) > 0:
+        last_time = result.index[-1]
+        candle_end = last_time + pd.Timedelta(minutes=minutes)
+
+        if candle_end > now:
+            result = result.iloc[:-1]
+
+    return result
 
 # ---------------- INDICATORS ----------------
 
-def calculate_indicators(df):
-    df = df.copy()
+def add_indicators(data):
+    df = data.copy()
 
     close = df["Close"]
     high = df["High"]
     low = df["Low"]
 
-    df["EMA9"] = close.ewm(span=9, adjust=False).mean()
-    df["EMA21"] = close.ewm(span=21, adjust=False).mean()
-    df["EMA50"] = close.ewm(span=50, adjust=False).mean()
+    df["EMA9"] = close.ewm(
+        span=9, adjust=False
+    ).mean()
+
+    df["EMA21"] = close.ewm(
+        span=21, adjust=False
+    ).mean()
+
+    df["EMA50"] = close.ewm(
+        span=50, adjust=False
+    ).mean()
 
     # RSI
     delta = close.diff()
+
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
-    avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+    avg_gain = gain.ewm(
+        alpha=1/14, adjust=False
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1/14, adjust=False
+    ).mean()
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
+
     df["RSI"] = 100 - (100 / (1 + rs))
     df["RSI"] = df["RSI"].fillna(50)
 
@@ -113,7 +150,8 @@ def calculate_indicators(df):
     ema26 = close.ewm(span=26, adjust=False).mean()
 
     df["MACD"] = ema12 - ema26
-    df["MACD_Signal"] = df["MACD"].ewm(
+
+    df["MACD_SIGNAL"] = df["MACD"].ewm(
         span=9, adjust=False
     ).mean()
 
@@ -127,332 +165,389 @@ def calculate_indicators(df):
     ], axis=1).max(axis=1)
 
     df["ATR"] = tr.ewm(
-        alpha=1/14,
-        adjust=False
+        alpha=1/14, adjust=False
     ).mean()
 
     # Supertrend
     hl2 = (high + low) / 2
-    upper = hl2 + (3 * df["ATR"])
-    lower = hl2 - (3 * df["ATR"])
 
-    supertrend = pd.Series(index=df.index, dtype=float)
-    direction = pd.Series(index=df.index, dtype=int)
+    upper = hl2 + 3 * df["ATR"]
+    lower = hl2 - 3 * df["ATR"]
+
+    st_line = pd.Series(
+        index=df.index,
+        dtype=float
+    )
+
+    st_direction = pd.Series(
+        index=df.index,
+        dtype=float
+    )
 
     for i in range(len(df)):
         if i == 0:
-            supertrend.iloc[i] = lower.iloc[i]
-            direction.iloc[i] = 1
+            st_line.iloc[i] = lower.iloc[i]
+            st_direction.iloc[i] = 1
             continue
 
-        previous_st = supertrend.iloc[i - 1]
-        previous_direction = direction.iloc[i - 1]
+        previous_line = st_line.iloc[i - 1]
 
-        if close.iloc[i] > previous_st:
-            direction.iloc[i] = 1
-            supertrend.iloc[i] = max(
-                lower.iloc[i],
-                previous_st
+        if close.iloc[i] > previous_line:
+            st_direction.iloc[i] = 1
+            st_line.iloc[i] = max(
+                lower.iloc[i], previous_line
             )
-        elif close.iloc[i] < previous_st:
-            direction.iloc[i] = -1
-            supertrend.iloc[i] = min(
-                upper.iloc[i],
-                previous_st
+
+        elif close.iloc[i] < previous_line:
+            st_direction.iloc[i] = -1
+            st_line.iloc[i] = min(
+                upper.iloc[i], previous_line
             )
+
         else:
-            direction.iloc[i] = previous_direction
-            supertrend.iloc[i] = previous_st
+            st_direction.iloc[i] = st_direction.iloc[i - 1]
+            st_line.iloc[i] = previous_line
 
-    df["Supertrend"] = supertrend
-    df["ST_Direction"] = direction
+    df["Supertrend"] = st_line
+    df["ST_DIRECTION"] = st_direction
 
     return df.dropna()
 
-# ---------------- STRATEGY ----------------
+# ---------------- TIMEFRAME ANALYSIS ----------------
 
-def make_signal(df):
+def analyze_timeframe(df):
+    if len(df) < 55:
+        return None
+
     last = df.iloc[-1]
-
-    price = float(last["Close"])
-    atr = float(last["ATR"])
 
     bullish = (
         last["EMA9"] > last["EMA21"]
         and last["EMA21"] > last["EMA50"]
-        and last["RSI"] > 50
-        and last["RSI"] < 70
-        and last["MACD"] > last["MACD_Signal"]
-        and last["ST_Direction"] == 1
+        and last["Close"] > last["EMA21"]
+        and last["ST_DIRECTION"] == 1
     )
 
     bearish = (
         last["EMA9"] < last["EMA21"]
         and last["EMA21"] < last["EMA50"]
-        and last["RSI"] < 50
-        and last["RSI"] > 30
-        and last["MACD"] < last["MACD_Signal"]
-        and last["ST_Direction"] == -1
+        and last["Close"] < last["EMA21"]
+        and last["ST_DIRECTION"] == -1
     )
 
-    if atr <= 0 or not np.isfinite(atr):
-        return {
-            "signal": "NO TRADE",
-            "entry": price,
-            "sl": None,
-            "t1": None,
-            "t2": None,
-            "t3": None,
-            "reasons": ["ATR data unavailable"]
-        }
-
-    if bullish:
-        sl = price - (1.5 * atr)
-        risk = price - sl
-
-        return {
-            "signal": "BUY",
-            "entry": price,
-            "sl": sl,
-            "t1": price + risk,
-            "t2": price + (2 * risk),
-            "t3": price + (3 * risk),
-            "reasons": [
-                "EMA 9 above EMA 21 and EMA 50",
-                "RSI confirms bullish momentum",
-                "MACD bullish crossover alignment",
-                "Supertrend bullish"
-            ]
-        }
-
-    if bearish:
-        sl = price + (1.5 * atr)
-        risk = sl - price
-
-        return {
-            "signal": "SELL",
-            "entry": price,
-            "sl": sl,
-            "t1": price - risk,
-            "t2": price - (2 * risk),
-            "t3": price - (3 * risk),
-            "reasons": [
-                "EMA 9 below EMA 21 and EMA 50",
-                "RSI confirms bearish momentum",
-                "MACD bearish alignment",
-                "Supertrend bearish"
-            ]
-        }
+    macd_bullish = last["MACD"] > last["MACD_SIGNAL"]
+    macd_bearish = last["MACD"] < last["MACD_SIGNAL"]
 
     return {
-        "signal": "NO TRADE",
-        "entry": price,
-        "sl": None,
-        "t1": None,
-        "t2": None,
-        "t3": None,
-        "reasons": [
-            "All strategy conditions are not aligned",
-            "Wait for trend confirmation"
-        ]
+        "price": float(last["Close"]),
+        "rsi": float(last["RSI"]),
+        "atr": float(last["ATR"]),
+        "ema9": float(last["EMA9"]),
+        "ema21": float(last["EMA21"]),
+        "ema50": float(last["EMA50"]),
+        "macd_bullish": bool(macd_bullish),
+        "macd_bearish": bool(macd_bearish),
+        "bullish": bool(bullish),
+        "bearish": bool(bearish),
+        "supertrend": float(last["Supertrend"]),
+        "time": str(df.index[-1])
     }
 
-# ---------------- LOAD DATA ----------------
+# ---------------- FINAL SIGNAL ----------------
+
+def final_signal(a3, a5, a15):
+    if not all([a3, a5, a15]):
+        return "NO TRADE", ["Insufficient timeframe data"]
+
+    reasons = []
+
+    bullish_count = sum([
+        a3["bullish"],
+        a5["bullish"],
+        a15["bullish"]
+    ])
+
+    bearish_count = sum([
+        a3["bearish"],
+        a5["bearish"],
+        a15["bearish"]
+    ])
+
+    # 15m main trend and 5m confirmation
+    # 3m entry timing
+
+    if a15["bullish"] and a5["bullish"] and a3["bullish"]:
+        # Avoid chasing an excessively extended candle
+        extension = (
+            a3["price"] - a3["ema21"]
+        ) / max(a3["atr"], 0.01)
+
+        if extension > 2.5:
+            reasons.append(
+                "Bullish trend, but price is too extended. "
+                "Wait for pullback."
+            )
+            return "NO TRADE", reasons
+
+        reasons.extend([
+            "15-minute bullish trend confirmed",
+            "5-minute bullish momentum confirmed",
+            "3-minute entry confirmation received"
+        ])
+
+        if a5["macd_bullish"]:
+            reasons.append("5-minute MACD bullish confirmation")
+        else:
+            reasons.append(
+                "MACD is lagging; EMA and trend confirmation are aligned"
+            )
+
+        return "BUY", reasons
+
+    if a15["bearish"] and a5["bearish"] and a3["bearish"]:
+        extension = (
+            a3["ema21"] - a3["price"]
+        ) / max(a3["atr"], 0.01)
+
+        if extension > 2.5:
+            reasons.append(
+                "Bearish trend, but price is too extended. "
+                "Wait for pullback."
+            )
+            return "NO TRADE", reasons
+
+        reasons.extend([
+            "15-minute bearish trend confirmed",
+            "5-minute bearish momentum confirmed",
+            "3-minute entry confirmation received"
+        ])
+
+        if a5["macd_bearish"]:
+            reasons.append("5-minute MACD bearish confirmation")
+        else:
+            reasons.append(
+                "MACD is lagging; EMA and trend confirmation are aligned"
+            )
+
+        return "SELL", reasons
+
+    reasons.append(
+        f"Bullish timeframes: {bullish_count}/3"
+    )
+    reasons.append(
+        f"Bearish timeframes: {bearish_count}/3"
+    )
+    reasons.append(
+        "All three timeframes are not aligned"
+    )
+
+    return "NO TRADE", reasons
+
+# ---------------- MAIN APP ----------------
 
 try:
-    raw = get_data(timeframe)
+    raw = download_data()
 
-    if raw.empty or len(raw) < 60:
+    if raw.empty:
         st.error(
-            "Market data unavailable or insufficient. "
-            "Please refresh after some time."
+            "Yahoo Finance data unavailable. "
+            "Refresh after some time."
         )
         st.stop()
 
-    df = calculate_indicators(raw)
+    df3 = add_indicators(make_timeframe(raw, 3))
+    df5 = add_indicators(make_timeframe(raw, 5))
+    df15 = add_indicators(make_timeframe(raw, 15))
 
-    if df.empty:
-        st.error("Indicators could not be calculated.")
+    a3 = analyze_timeframe(df3)
+    a5 = analyze_timeframe(df5)
+    a15 = analyze_timeframe(df15)
+
+    if not all([a3, a5, a15]):
+        st.error(
+            "Not enough completed candles for all timeframes."
+        )
         st.stop()
 
-except Exception as e:
-    st.error(f"Data error: {e}")
+    signal, reasons = final_signal(a3, a5, a15)
+
+except Exception as error:
+    st.error(f"Dashboard error: {error}")
     st.stop()
 
-result = make_signal(df)
-last = df.iloc[-1]
-
-# ---------------- MARKET STATUS ----------------
+# ---------------- MARKET SUMMARY ----------------
 
 st.subheader("Market Overview")
 
-c1, c2, c3, c4 = st.columns(4)
+m1, m2, m3, m4 = st.columns(4)
 
-c1.metric(
-    "NIFTY Price",
-    f"{result['entry']:,.2f}"
-)
-
-c2.metric(
-    "RSI",
-    f"{last['RSI']:.2f}"
-)
-
-c3.metric(
-    "ATR",
-    f"{last['ATR']:.2f}"
-)
-
-c4.metric(
-    "Timeframe",
-    timeframe
-)
+m1.metric("NIFTY Price", f"{a3['price']:,.2f}")
+m2.metric("3M RSI", f"{a3['rsi']:.2f}")
+m3.metric("5M RSI", f"{a5['rsi']:.2f}")
+m4.metric("15M RSI", f"{a15['rsi']:.2f}")
 
 st.caption(
-    f"Last candle timestamp: {df.index[-1]}"
+    f"Last completed 3m candle: {a3['time']}"
 )
 
-# ---------------- SIGNAL ----------------
+# ---------------- TIMEFRAME TABLE ----------------
 
 st.divider()
-st.subheader("🎯 Trading Signal")
+st.subheader("Multi-Timeframe Confirmation")
 
-signal = result["signal"]
-
-if signal == "BUY":
-    st.success("BUY SIGNAL — Bullish conditions aligned")
-elif signal == "SELL":
-    st.error("SELL SIGNAL — Bearish conditions aligned")
-else:
-    st.warning("NO TRADE — Wait for confirmation")
-
-a, b, c = st.columns(3)
-
-a.metric("Entry Price", f"{result['entry']:,.2f}")
-
-if result["sl"] is not None:
-    b.metric("Stop Loss", f"{result['sl']:,.2f}")
-    c.metric("Target 1", f"{result['t1']:,.2f}")
-
-    x, y = st.columns(2)
-    x.metric("Target 2", f"{result['t2']:,.2f}")
-    y.metric("Target 3", f"{result['t3']:,.2f}")
-else:
-    b.metric("Stop Loss", "Not generated")
-    c.metric("Targets", "Not generated")
-
-st.markdown("**Signal Reasons**")
-for reason in result["reasons"]:
-    st.write("•", reason)
-
-# ---------------- RISK MANAGEMENT ----------------
-
-st.divider()
-st.subheader("💰 Risk Management")
-
-if result["sl"] is not None:
-    risk_points = abs(result["entry"] - result["sl"])
-    risk_amount = capital * risk_percent / 100
-
-    if risk_points > 0:
-        estimated_quantity = int(risk_amount / risk_points)
-
-        st.write(
-            f"Maximum planned risk: ₹{risk_amount:,.2f}"
-        )
-        st.write(
-            f"Risk distance: {risk_points:.2f} index points"
-        )
-        st.write(
-            f"Illustrative quantity by risk: {estimated_quantity}"
-        )
-
-        st.caption(
-            "This is an index-point calculation, not an option lot "
-            "recommendation. For options, premium, lot size, spread, "
-            "slippage and contract specifications must be checked separately."
-        )
-else:
-    st.info("No trade: risk sizing is not available.")
-
-# ---------------- INDICATOR TABLE ----------------
-
-st.divider()
-st.subheader("📊 Indicator Details")
-
-indicator_data = pd.DataFrame({
-    "Indicator": [
-        "EMA 9",
-        "EMA 21",
-        "EMA 50",
-        "RSI",
-        "MACD",
-        "MACD Signal",
-        "Supertrend",
-        "ATR"
-    ],
-    "Value": [
-        round(float(last["EMA9"]), 2),
-        round(float(last["EMA21"]), 2),
-        round(float(last["EMA50"]), 2),
-        round(float(last["RSI"]), 2),
-        round(float(last["MACD"]), 2),
-        round(float(last["MACD_Signal"]), 2),
-        round(float(last["Supertrend"]), 2),
-        round(float(last["ATR"]), 2)
-    ]
-})
+timeframe_table = pd.DataFrame([
+    {
+        "Timeframe": "3 Minutes",
+        "Trend": "BULLISH" if a3["bullish"] else (
+            "BEARISH" if a3["bearish"] else "NEUTRAL"
+        ),
+        "RSI": round(a3["rsi"], 2),
+        "MACD": "Bullish" if a3["macd_bullish"] else "Bearish",
+        "Price": round(a3["price"], 2)
+    },
+    {
+        "Timeframe": "5 Minutes",
+        "Trend": "BULLISH" if a5["bullish"] else (
+            "BEARISH" if a5["bearish"] else "NEUTRAL"
+        ),
+        "RSI": round(a5["rsi"], 2),
+        "MACD": "Bullish" if a5["macd_bullish"] else "Bearish",
+        "Price": round(a5["price"], 2)
+    },
+    {
+        "Timeframe": "15 Minutes",
+        "Trend": "BULLISH" if a15["bullish"] else (
+            "BEARISH" if a15["bearish"] else "NEUTRAL"
+        ),
+        "RSI": round(a15["rsi"], 2),
+        "MACD": "Bullish" if a15["macd_bullish"] else "Bearish",
+        "Price": round(a15["price"], 2)
+    }
+])
 
 st.dataframe(
-    indicator_data,
+    timeframe_table,
     use_container_width=True,
     hide_index=True
 )
 
+# ---------------- FINAL TRADE SIGNAL ----------------
+
+st.divider()
+st.subheader("🎯 FINAL TRADING SIGNAL")
+
+if signal == "BUY":
+    st.success("🟢 FINAL SIGNAL: BUY")
+elif signal == "SELL":
+    st.error("🔴 FINAL SIGNAL: SELL")
+else:
+    st.warning("🟡 FINAL SIGNAL: NO TRADE")
+
+for reason in reasons:
+    st.write("•", reason)
+
+# ---------------- ENTRY SL TARGETS ----------------
+
+st.divider()
+st.subheader("Entry, Stop Loss & Targets")
+
+if signal in ["BUY", "SELL"]:
+
+    entry = a3["price"]
+
+    # Use 3m ATR, with 5m ATR as a volatility reference
+    atr = max(a3["atr"], a5["atr"] * 0.5)
+
+    risk_points = 1.5 * atr
+
+    if signal == "BUY":
+        sl = entry - risk_points
+        t1 = entry + risk_points
+        t2 = entry + (2 * risk_points)
+        t3 = entry + (3 * risk_points)
+    else:
+        sl = entry + risk_points
+        t1 = entry - risk_points
+        t2 = entry - (2 * risk_points)
+        t3 = entry - (3 * risk_points)
+
+    p1, p2, p3 = st.columns(3)
+
+    p1.metric("Entry", f"{entry:,.2f}")
+    p2.metric("Stop Loss", f"{sl:,.2f}")
+    p3.metric("Target 1", f"{t1:,.2f}")
+
+    p4, p5 = st.columns(2)
+
+    p4.metric("Target 2", f"{t2:,.2f}")
+    p5.metric("Target 3", f"{t3:,.2f}")
+
+    # Index-point risk illustration only
+    risk_amount = capital * risk_percent / 100
+    index_quantity = int(risk_amount / risk_points)
+
+    st.write(f"Risk budget: ₹{risk_amount:,.2f}")
+    st.write(f"Risk distance: {risk_points:.2f} index points")
+    st.write(
+        f"Illustrative index quantity: {index_quantity}"
+    )
+
+    st.caption(
+        "This is not an options position size. "
+        "NIFTY index points are not option premium points. "
+        "Verify actual CE/PE premium, spread, lot size and slippage separately."
+    )
+
+else:
+    st.info(
+        "No entry, stop loss or targets generated because "
+        "the three timeframes are not aligned."
+    )
+
 # ---------------- CHART ----------------
 
 st.divider()
-st.subheader("📈 NIFTY Chart")
+st.subheader("NIFTY 3-Minute Chart")
 
 chart = go.Figure()
 
 chart.add_trace(go.Candlestick(
-    x=df.index,
-    open=df["Open"],
-    high=df["High"],
-    low=df["Low"],
-    close=df["Close"],
+    x=df3.index,
+    open=df3["Open"],
+    high=df3["High"],
+    low=df3["Low"],
+    close=df3["Close"],
     name="NIFTY"
 ))
 
 chart.add_trace(go.Scatter(
-    x=df.index,
-    y=df["EMA9"],
+    x=df3.index,
+    y=df3["EMA9"],
     name="EMA 9"
 ))
 
 chart.add_trace(go.Scatter(
-    x=df.index,
-    y=df["EMA21"],
+    x=df3.index,
+    y=df3["EMA21"],
     name="EMA 21"
 ))
 
 chart.add_trace(go.Scatter(
-    x=df.index,
-    y=df["EMA50"],
+    x=df3.index,
+    y=df3["EMA50"],
     name="EMA 50"
 ))
 
 chart.add_trace(go.Scatter(
-    x=df.index,
-    y=df["Supertrend"],
+    x=df3.index,
+    y=df3["Supertrend"],
     name="Supertrend"
 ))
 
 chart.update_layout(
-    height=650,
-    xaxis_rangeslider_visible=False,
-    template="plotly_dark"
+    height=600,
+    template="plotly_dark",
+    xaxis_rangeslider_visible=False
 )
 
 st.plotly_chart(
@@ -460,15 +555,15 @@ st.plotly_chart(
     use_container_width=True
 )
 
-# ---------------- RSI CHART ----------------
+# ---------------- RSI ----------------
 
-st.subheader("RSI Chart")
+st.subheader("3-Minute RSI")
 
 rsi_chart = go.Figure()
 
 rsi_chart.add_trace(go.Scatter(
-    x=df.index,
-    y=df["RSI"],
+    x=df3.index,
+    y=df3["RSI"],
     name="RSI"
 ))
 
@@ -486,19 +581,33 @@ st.plotly_chart(
     use_container_width=True
 )
 
-# ---------------- DISCLAIMER ----------------
+# ---------------- STATUS ----------------
 
 st.divider()
+st.subheader("System Status")
+
+s1, s2, s3 = st.columns(3)
+
+s1.success("3-minute data calculated")
+s2.success("5-minute data calculated")
+s3.success("15-minute data calculated")
+
+st.caption(
+    "Data source: Yahoo Finance. Data may be delayed, incomplete "
+    "or unavailable. Resampled candles are calculated from 1-minute data."
+)
 
 st.warning(
-    "IMPORTANT: This dashboard is an educational technical-analysis "
-    "tool, not a guaranteed trading system. BUY/SELL signals can fail. "
-    "Targets are calculated risk/reward levels, not price forecasts. "
-    "Yahoo Finance data may be delayed or incomplete. Verify prices, "
-    "liquidity, brokerage costs and exchange data before trading. "
-    "Paper trade and backtest before risking real money."
+    "Trading risk: Signals are technical conditions, not guaranteed "
+    "predictions. SL and targets are ATR-based reference levels, "
+    "not guaranteed execution prices. Backtest and paper trade before "
+    "using real capital. This dashboard does not provide personalized "
+    "financial advice."
 )
 
 st.caption(
-    f"Dashboard refreshed/rendered: {datetime.now().strftime('%d-%m-%Y %H:%M:%S')}"
-)
+    "Rendered: " +
+    datetime.now(ZoneInfo("Asia/Kolkata")).strftime(
+        "%d-%m-%Y %H:%M:%S"
+    )
+    )
