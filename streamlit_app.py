@@ -611,3 +611,57 @@ st.caption(
         "%d-%m-%Y %H:%M:%S"
     )
     )
+# ==============================
+# OPTION BUYING RECOMMENDATION
+# ==============================
+
+st.subheader("🎯 Option Buying Recommendation")
+
+if "option_chain" in locals() and "final_signal" in locals():
+
+    if final_signal in ["BUY", "BULLISH"]:
+        option_type = "CE"
+        premium_col = "CE_LTP"
+
+    elif final_signal in ["SELL", "BEARISH"]:
+        option_type = "PE"
+        premium_col = "PE_LTP"
+
+    else:
+        option_type = None
+
+    if option_type:
+        chain = option_chain.dropna(subset=[premium_col, "strike"])
+
+        chain = chain[chain[premium_col] > 0]
+
+        if not chain.empty:
+            selected = chain.iloc[
+                (chain[premium_col] - 120).abs().argsort()[:1]
+            ].iloc[0]
+
+            strike = selected["strike"]
+            premium = float(selected[premium_col])
+
+            sl = round(premium * 0.80, 2)
+            target1 = round(premium * 1.30, 2)
+            target2 = round(premium * 1.50, 2)
+
+            st.success(f"BUY {option_type}")
+
+            st.write(f"**Option:** NIFTY {strike} {option_type}")
+            st.write(f"**Strike Price:** {strike}")
+            st.write(f"**Current Premium:** ₹{premium:.2f}")
+            st.write(f"**Entry Premium:** ₹{premium:.2f}")
+            st.write(f"**Stop Loss:** ₹{sl:.2f}")
+            st.write(f"**Target 1:** ₹{target1:.2f}")
+            st.write(f"**Target 2:** ₹{target2:.2f}")
+
+        else:
+            st.warning("Live option premium unavailable.")
+
+    else:
+        st.info("NO TRADE - Wait for confirmation.")
+
+else:
+    st.warning("Option chain data or signal variable not found.")
