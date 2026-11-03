@@ -504,9 +504,7 @@ if not vwap_available:
 if not volume_available:
     reasons.append("Volume confirmation unavailable.")
 
-except Exception as error:
-    st.error(f"Dashboard error: {error}")
-    st.stop()
+
 
 # ---------------- MARKET SUMMARY ----------------
 
