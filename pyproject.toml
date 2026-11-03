@@ -1,5 +1,5 @@
 [project]
-name = "nifty50-pro-dashboard"
+name = "nifty50-pro-max"
 version = "1.0.0"
 description = "Advanced NIFTY 50 Trading Dashboard"
 requires-python = ">=3.11,<3.14"
