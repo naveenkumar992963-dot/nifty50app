@@ -1,14 +1,19 @@
+
 [project]
-name = "nifty50-pro-max"
-version = "1.0.0"
-description = "Advanced NIFTY 50 Trading Dashboard"
+name = "nifty-ai-intelligence-terminal"
+version = "3.0.0"
+description = "NIFTY 50 News Intelligence and ML Dashboard"
 requires-python = ">=3.11,<3.14"
 
 dependencies = [
-    "streamlit>=1.61.1",
+    "streamlit>=1.40.0",
     "yfinance>=0.2.40",
-    "pandas>=2.0",
-    "numpy>=1.24"
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "scikit-learn>=1.5.0",
+    "requests>=2.31.0",
+    "feedparser>=6.0.11",
+    "plotly>=5.20.0"
 ]
 
 [tool.uv]
