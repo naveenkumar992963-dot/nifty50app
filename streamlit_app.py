@@ -665,261 +665,48 @@ if "option_chain" in locals() and "final_signal" in locals():
 
 else:
     st.warning("Option chain data or signal variable not found.")
-# ==========================================
-# ADDITIONAL MARKET CONFIRMATION ANALYSIS
-# Paste at the very bottom of your existing code
-# ==========================================
-
-st.divider()
-st.subheader("📊 Advanced Market Confirmation")
-
-# VWAP calculation
-vwap_data = df3.copy()
-
-typical_price = (
-    vwap_data["High"] +
-    vwap_data["Low"] +
-    vwap_data["Close"]
-) / 3
-
-volume_sum = vwap_data["Volume"].cumsum()
-
-vwap_data["VWAP"] = (
-    (typical_price * vwap_data["Volume"]).cumsum()
-    / volume_sum.replace(0, np.nan)
-)
-
-last = vwap_data.iloc[-1]
-
-# Volume average
-vwap_data["Volume_AVG"] = (
-    vwap_data["Volume"].rolling(20).mean()
-)
-
-last_volume = float(last["Volume"])
-avg_volume = float(last["Volume_AVG"])
-
-# Confirmation conditions
-rsi_bull = a3["rsi"] > 50
-rsi_bear = a3["rsi"] < 50
-
-macd_bull = a3["macd_bullish"]
-macd_bear = a3["macd_bearish"]
-
-vwap_bull = (
-    float(last["Close"]) > float(last["VWAP"])
-)
-
-vwap_bear = (
-    float(last["Close"]) < float(last["VWAP"])
-)
-
-volume_confirmed = (
-    last_volume > avg_volume
-    if pd.notna(avg_volume)
-    else False
-)
-
-# Display confirmation table
-confirmation_table = pd.DataFrame([
-    {
-        "Indicator": "RSI",
-        "Value": round(a3["rsi"], 2),
-        "Status": "Bullish" if rsi_bull else (
-            "Bearish" if rsi_bear else "Neutral"
-        )
-    },
-    {
-        "Indicator": "MACD",
-        "Value": round(
-            float(df3["MACD"].iloc[-1]), 2
-        ),
-        "Status": "Bullish" if macd_bull else "Bearish"
-    },
-    {
-        "Indicator": "VWAP",
-        "Value": round(float(last["VWAP"]), 2),
-        "Status": "Bullish" if vwap_bull else "Bearish"
-    },
-    {
-        "Indicator": "Volume",
-        "Value": round(last_volume, 0),
-        "Status": "Confirmed" if volume_confirmed else "Weak"
-    }
-])
-
-st.dataframe(
-    confirmation_table,
-    use_container_width=True,
-    hide_index=True
-)
-
-# Confirmation score
-if signal == "BUY":
-    score = sum([
-        rsi_bull,
-        macd_bull,
-        vwap_bull,
-        volume_confirmed
-    ])
-
-elif signal == "SELL":
-    score = sum([
-        rsi_bear,
-        macd_bear,
-        vwap_bear,
-        volume_confirmed
-    ])
-
-else:
-    score = 0
-
-st.metric(
-    "Additional Confirmation Score",
-    f"{score}/4"
-)
-
-if score >= 3:
-    st.success("Strong additional confirmation")
-elif score == 2:
-    st.warning("Moderate additional confirmation")
-else:
-    st.info("Weak additional confirmation")
-
-st.caption(
-    "Additional confirmation only. This score does not guarantee "
-    "profit and does not modify the original trading signal."
-    )
-# ==========================================
-# ADVANCED MARKET CONFIRMATION - FIXED
-# ==========================================
+# ===== SAFE ADVANCED CONFIRMATION =====
 
 st.divider()
 st.subheader("📊 Advanced Market Confirmation")
 
 vwap_data = df3.copy()
 
-# Ensure numeric volume
 vwap_data["Volume"] = pd.to_numeric(
     vwap_data["Volume"], errors="coerce"
 ).fillna(0)
 
-# VWAP
+vwap_data["Volume_AVG"] = (
+    vwap_data["Volume"].rolling(20, min_periods=1).mean()
+)
+
 typical_price = (
     vwap_data["High"] +
     vwap_data["Low"] +
     vwap_data["Close"]
 ) / 3
 
-cumulative_volume = vwap_data["Volume"].cumsum()
+cum_vol = vwap_data["Volume"].cumsum()
 
 vwap_data["VWAP"] = (
     (typical_price * vwap_data["Volume"]).cumsum()
-    / cumulative_volume.replace(0, np.nan)
-)
-
-# Volume average - calculate BEFORE selecting last row
-vwap_data["Volume_AVG"] = (
-    vwap_data["Volume"].rolling(20, min_periods=1).mean()
+    / cum_vol.replace(0, np.nan)
 )
 
 last = vwap_data.iloc[-1]
 
-last_volume = float(last["Volume"])
-avg_volume = float(last["Volume_AVG"])
+st.write("RSI:", round(float(a3["rsi"]), 2))
+st.write("MACD:", "Bullish" if a3["macd_bullish"] else "Bearish")
 
-current_vwap = last["VWAP"]
-
-# Conditions
-rsi_bull = a3["rsi"] > 50
-rsi_bear = a3["rsi"] < 50
-
-macd_bull = a3["macd_bullish"]
-macd_bear = a3["macd_bearish"]
-
-vwap_bull = (
-    pd.notna(current_vwap)
-    and float(last["Close"]) > float(current_vwap)
-)
-
-vwap_bear = (
-    pd.notna(current_vwap)
-    and float(last["Close"]) < float(current_vwap)
-)
-
-volume_confirmed = (
-    avg_volume > 0 and last_volume > avg_volume
-)
-
-# Table
-confirmation_table = pd.DataFrame([
-    {
-        "Indicator": "RSI",
-        "Value": round(a3["rsi"], 2),
-        "Status": "Bullish" if rsi_bull else "Bearish"
-    },
-    {
-        "Indicator": "MACD",
-        "Value": round(float(df3["MACD"].iloc[-1]), 2),
-        "Status": "Bullish" if macd_bull else "Bearish"
-    },
-    {
-        "Indicator": "VWAP",
-        "Value": (
-            round(float(current_vwap), 2)
-            if pd.notna(current_vwap) else "Unavailable"
-        ),
-        "Status": (
-            "Bullish" if vwap_bull
-            else "Bearish" if vwap_bear
-            else "Unavailable"
-        )
-    },
-    {
-        "Indicator": "Volume",
-        "Value": round(last_volume, 0),
-        "Status": (
-            "Confirmed" if volume_confirmed else "Weak"
-        )
-    }
-])
-
-st.dataframe(
-    confirmation_table,
-    use_container_width=True,
-    hide_index=True
-)
-
-# Score
-if signal == "BUY":
-    score = sum([
-        rsi_bull,
-        macd_bull,
-        vwap_bull,
-        volume_confirmed
-    ])
-
-elif signal == "SELL":
-    score = sum([
-        rsi_bear,
-        macd_bear,
-        vwap_bear,
-        volume_confirmed
-    ])
-
+if pd.notna(last["VWAP"]):
+    st.write("VWAP:", round(float(last["VWAP"]), 2))
 else:
-    score = 0
+    st.write("VWAP: Unavailable")
 
-st.metric("Additional Confirmation Score", f"{score}/4")
-
-if score >= 3:
-    st.success("Strong additional confirmation")
-elif score == 2:
-    st.warning("Moderate additional confirmation")
-else:
-    st.info("Weak additional confirmation")
-
-st.caption(
-    "Additional analysis only. Original BUY/SELL signal is unchanged. "
-    "Volume data quality depends on the Yahoo Finance feed."
+st.write(
+    "Volume:",
+    "Confirmed" if last["Volume"] > last["Volume_AVG"]
+    else "Weak"
 )
+
+st.caption("Additional analysis only. Original signal unchanged.")
