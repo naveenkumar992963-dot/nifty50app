@@ -339,6 +339,29 @@ def max_pain(chain):
         payouts.append(call_loss.sum()+put_loss.sum())
     return float(strikes[int(np.argmin(payouts))])
 
+# Option premium levels are distinct from NIFTY index levels.
+option_entry=option_sl=option_t1=option_t2=option_rr=None
+if candidate is not None and signal in ("BUY","SELL"):
+    side_name="CE" if signal=="BUY" else "PE"
+    option_entry=float(candidate[f"{side_name} LTP"])
+    # Conservative premium-risk template; calibrate with historical option backtests before use.
+    option_sl=max(0.05,option_entry*0.70)
+    option_t1=option_entry*1.30
+    option_t2=option_entry*1.60
+    option_risk=option_entry-option_sl
+    option_rr=(option_t1-option_entry)/option_risk if option_risk>0 else None
+    st.subheader("Final Option Trade Plan")
+    p1,p2,p3,p4,p5=st.columns(5)
+    p1.metric("Selection",side_name)
+    p2.metric("Option entry",f"₹{option_entry:.2f}")
+    p3.metric("Option stop loss",f"₹{option_sl:.2f}")
+    p4.metric("Target 1 / 2",f"₹{option_t1:.2f} / ₹{option_t2:.2f}")
+    p5.metric("Risk : Reward",f"1 : {option_rr:.2f}" if option_rr is not None else "N/A")
+    st.caption("Option levels are illustrative premium-based levels from the current chain snapshot; spread, slippage, IV crush and lot size are not modelled.")
+else:
+    st.subheader("Final Option Trade Plan")
+    st.info("NO TRADE or no valid option contract: CE/PE, premium entry, SL, targets and R:R are withheld.")
+
 # -------------------- PAPER TRADING --------------------
 def save_close(exit_px, reason):
     t=st.session_state.open_paper
@@ -353,7 +376,67 @@ def save_close(exit_px, reason):
         "Points":round(pts,2),"Virtual P&L ₹":round(pnl,2),"Reason":reason})
     st.session_state.open_paper=None
 
-# -------------------- FETCH & PROCESS --------------------
+
+# -------------------- FIVE-STRATEGY ENSEMBLE --------------------
+def clamp(v, lo=-1.0, hi=1.0):
+    return float(max(lo, min(hi, v)))
+
+def combined_strategy_scores(d3, d5, d15, chain_stats, ml_metrics):
+    """Five independent strategy votes. Scores are heuristic, not calibrated probabilities."""
+    last5=d5.iloc[-1]; last3=d3.iloc[-1]
+    # 1) Trend-following: multi-timeframe EMA alignment + supertrend
+    trend_votes=[]
+    for d in (d3,d5,d15):
+        x=d.iloc[-1]
+        trend_votes.append(1.0 if x.EMA9>x.EMA21>x.EMA50 and x.ST_DIR>0 else
+                           -1.0 if x.EMA9<x.EMA21<x.EMA50 and x.ST_DIR<0 else 0.0)
+    trend=float(np.mean(trend_votes))
+    # 2) VWAP + volume breakout/acceptance
+    vwap_score=0.0
+    if pd.notna(last5.get("VWAP")) and pd.notna(last5.get("VOL_RATIO")):
+        if last5.Close>last5.VWAP and last5.VOL_RATIO>=1.2: vwap_score=1.0
+        elif last5.Close<last5.VWAP and last5.VOL_RATIO>=1.2: vwap_score=-1.0
+        elif last5.Close>last5.VWAP: vwap_score=0.35
+        elif last5.Close<last5.VWAP: vwap_score=-0.35
+    # 3) Mean reversion: Bollinger z-score + RSI, contrarian direction
+    mean_score=0.0
+    mid=d5.Close.rolling(20).mean().iloc[-1]
+    sd=d5.Close.rolling(20).std().iloc[-1]
+    if pd.notna(mid) and pd.notna(sd) and sd>0:
+        z=(last5.Close-mid)/(2*sd)
+        if z<=-1 and last5.RSI<38: mean_score=1.0
+        elif z>=1 and last5.RSI>62: mean_score=-1.0
+        elif z<=-0.6: mean_score=0.35
+        elif z>=0.6: mean_score=-0.35
+    # 4) Donchian breakout using previous 20 completed bars, current bar excluded
+    prior=d5.iloc[:-1].tail(20)
+    donchian=0.0
+    if len(prior)>=15:
+        if last5.Close>prior.High.max(): donchian=1.0
+        elif last5.Close<prior.Low.min(): donchian=-1.0
+    # 5) Option chain positioning: PCR plus dominant OI walls relative to spot
+    oi_score=0.0
+    if chain_stats and np.isfinite(chain_stats.get("pcr",np.nan)):
+        pcr=chain_stats["pcr"]
+        if pcr>=1.25: oi_score=0.75
+        elif pcr<=0.75: oi_score=-0.75
+        elif pcr>1.05: oi_score=0.35
+        elif pcr<0.95: oi_score=-0.35
+    weights={"Trend Following":0.25,"VWAP + Volume":0.20,"Mean Reversion":0.15,
+             "Donchian Breakout":0.15,"Options OI + PCR":0.25}
+    scores={"Trend Following":trend,"VWAP + Volume":vwap_score,
+            "Mean Reversion":mean_score,"Donchian Breakout":donchian,
+            "Options OI + PCR":oi_score}
+    weighted=sum(scores[k]*weights[k] for k in scores)
+    ml_adj=0.0
+    if ml_metrics and "p_up" in ml_metrics:
+        ml_adj=clamp((ml_metrics["p_up"]-0.5)*2)*0.10
+    final_score=clamp(weighted+ml_adj)
+    # Confidence is a heuristic agreement score, explicitly not calibrated probability.
+    agreement=sum(weights[k] for k,v in scores.items() if (v>0 and final_score>0) or (v<0 and final_score<0))
+    confidence=clamp(abs(final_score)*0.75+agreement*0.25,0,1)*100
+    return scores,weights,final_score,confidence
+    # -------------------- FETCH & PROCESS --------------------
 try:
     now=datetime.now(IST)
     from_date=(now.date()-timedelta(days=25)).isoformat()
@@ -386,13 +469,28 @@ try:
         chain=pd.DataFrame()
     # ML on 5m features
     ml_model,ml_metrics=train_ml(d5)
-    signal,ml_directional_prob,reasons=decide_signal(s3,s5,s15,ml_metrics if ml_model is not None else None,stats,stale)
+    strategy_scores,strategy_weights,combined_score,ai_confidence=combined_strategy_scores(
+        d3,d5,d15,stats,ml_metrics if ml_model is not None else None)
+    # One consolidated result only. Conservative thresholds reduce low-conviction trades.
+    if stale:
+        signal="NO TRADE"; reasons=["Market feed stale: signal blocked."]
+    elif combined_score>=0.30 and ai_confidence>=55:
+        signal="BUY"; reasons=["Five-strategy weighted score supports bullish bias."]
+    elif combined_score<=-0.30 and ai_confidence>=55:
+        signal="SELL"; reasons=["Five-strategy weighted score supports bearish bias."]
+    else:
+        signal="NO TRADE"; reasons=["Strategy agreement/combined score is insufficient."]
+    # ML conflict veto when a model estimate is available.
+    if ml_model is not None:
+        if signal=="BUY" and ml_metrics["p_up"]<0.45:
+            signal="NO TRADE"; reasons.append("ML model conflicts with BUY bias.")
+        elif signal=="SELL" and ml_metrics["p_up"]>0.55:
+            signal="NO TRADE"; reasons.append("ML model conflicts with SELL bias.")
 except Exception as e:
     st.error(f"Data / API error: {e}")
     st.info("Secrets में UPSTOX_ACCESS_TOKEN और UPSTOX_INSTRUMENT_KEY = NSE_INDEX|Nifty 50 जाँचें. Option chain API access भी आवश्यक है.")
     st.stop()
-
-# -------------------- OVERVIEW --------------------
+    # -------------------- OVERVIEW --------------------
 st.divider()
 st.subheader("Market Snapshot")
 c=st.columns(5)
@@ -455,15 +553,24 @@ else:
 
 # -------------------- FINAL SIGNAL --------------------
 st.divider()
-st.subheader("AI + Rules + Options Decision")
-if signal=="BUY": st.success("🟢 NIFTY BIAS: BULLISH")
-elif signal=="SELL": st.error("🔴 NIFTY BIAS: BEARISH")
-else: st.warning("🟡 NO TRADE")
+st.subheader("FINAL AI SIGNAL — Combined Five-Strategy Result")
+if signal=="BUY": st.success("🟢 FINAL SIGNAL: BUY")
+elif signal=="SELL": st.error("🔴 FINAL SIGNAL: SELL")
+else: st.warning("🟡 FINAL SIGNAL: NO TRADE")
+f1,f2,f3=st.columns(3)
+f1.metric("AI confidence score",f"{ai_confidence:.1f}%",help="Heuristic agreement score, not calibrated win probability.")
+f2.metric("Combined strategy score",f"{combined_score:+.3f}",help="Weighted directional score from -1 (bearish) to +1 (bullish).")
+f3.metric("Option selection","CE" if signal=="BUY" else "PE" if signal=="SELL" else "NONE")
+st.caption("Only one consolidated result is shown. Individual strategy scores below are diagnostic components.")
+score_rows=[]
+for name,val in strategy_scores.items():
+    score_rows.append({"Strategy":name,"Weight":f"{strategy_weights[name]*100:.0f}%","Directional score":round(val,2),
+                       "Contribution":round(val*strategy_weights[name],3)})
+st.dataframe(pd.DataFrame(score_rows),use_container_width=True,hide_index=True)
 for r in reasons: st.write("• "+r)
 if ml_model is not None:
-    st.write(f"ML direction score: {ml_metrics['p_up']*100:.1f}% Up, {(1-ml_metrics['p_up'])*100:.1f}% Down")
-
-# -------------------- OPTION BUYING CANDIDATE --------------------
+    st.caption(f"ML model estimate: {ml_metrics['p_up']*100:.1f}% Up / {(1-ml_metrics['p_up'])*100:.1f}% Down. Holdout accuracy: {ml_metrics['accuracy']*100:.1f}%.")
+    # -------------------- OPTION BUYING CANDIDATE --------------------
 st.subheader("CE / PE Paper-Buy Candidate")
 candidate=None
 if not chain.empty and signal in ("BUY","SELL"):
@@ -484,7 +591,8 @@ if not chain.empty and signal in ("BUY","SELL"):
         st.info("Directional signal मिला, लेकिन usable CE/PE contract data नहीं मिला.")
 else:
     st.info("Option candidate तभी बनेगा जब NIFTY directional signal और usable option chain दोनों उपलब्ध हों.")
-    # -------------------- LEVELS & RISK --------------------
+
+# -------------------- LEVELS & RISK --------------------
 st.divider()
 st.subheader("Risk & Index Levels (Research only)")
 entry=spot
@@ -627,6 +735,6 @@ st.write(f"- Data source: Upstox REST V3 candles + V3 LTP + V2 option chain")
 st.write(f"- Last candle timestamp: {latest}")
 st.write(f"- Data stale guard: {'TRIGGERED' if stale else 'Not triggered'}")
 st.write("- Session-state paper history may reset if Streamlit session/server restarts; export or persistent storage is not configured.")
-st.write("- Model is trained on recent intraday data in-session. It is not a production-grade institutional model and does not include news, order book, exchange tick replay, or a separately validated calibrated probability.")
+st.write("- Five strategy ensemble uses heuristic weights; the displayed confidence is not calibrated probability. ML is a recent-data research model, not a production-grade institutional model. News, order book and exchange tick replay are not included.")
 st.write("- Option chain is a snapshot, not a tick-by-tick feed. Paper option P&L excludes costs, spread impact and lot-size constraints.")
 st.error("Educational research tool only. No guaranteed prediction. Never treat a model score or paper result as a promise of live returns.")
