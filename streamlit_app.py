@@ -1,172 +1,270 @@
+
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import yfinance as yf
+import requests
+import feedparser
+import xml.etree.ElementTree as ET
+import plotly.graph_objects as go
+from datetime import datetime, timezone
+from urllib.parse import quote
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+import warnings
 
-# ==========================================
-# NIFTY 50 PRO MAX - FINAL DASHBOARD
-# ==========================================
+warnings.filterwarnings("ignore")
 
+# =========================================================
+# PAGE CONFIG
+# =========================================================
 st.set_page_config(
-    page_title="NIFTY 50 PRO MAX",
+    page_title="NIFTY AI Intelligence Terminal",
     page_icon="📈",
     layout="wide"
 )
 
-st.title("🚀 NIFTY 50 PRO MAX")
-st.caption("Advanced Multi-Timeframe Trading Analysis")
-
-# ==========================================
-# SIDEBAR SETTINGS
-# ==========================================
-
-st.sidebar.title("⚙️ Trading Settings")
-
-sl_multiplier = st.sidebar.number_input(
-    "Stop Loss ATR Multiplier",
-    min_value=0.5,
-    max_value=3.0,
-    value=1.2,
-    step=0.1
+st.title("📈 NIFTY 50 — AI Intelligence & Options Terminal")
+st.caption(
+    "Live public news + market data + FII/DII + option chain "
+    "+ technical analysis + experimental ML"
 )
 
-signal_threshold = st.sidebar.slider(
-    "Minimum Signal Agreement",
-    min_value=50,
-    max_value=90,
-    value=65,
-    step=5
+# =========================================================
+# CONSTANTS
+# =========================================================
+NSE_HOME = "https://www.nseindia.com/"
+NSE_OPTION_URL = (
+    "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
 )
+NSE_FII_URL = "https://www.nseindia.com/api/fiidiiTradeReact"
 
-st.sidebar.info(
-    "Market: NIFTY 50 Index\n\n"
-    "Timeframes: 5m, 15m, 1H"
-)
+NEWS_QUERIES = [
+    "NIFTY 50 Indian stock market",
+    "India RBI interest rate inflation",
+    "India FII DII stock market",
+    "India stock market crude oil rupee",
+    "NIFTY options market derivatives",
+    "India economy government policy",
+    "US Federal Reserve global markets"
+]
 
-# ==========================================
-# DATA FETCH
-# ==========================================
+# =========================================================
+# HTTP SESSION
+# =========================================================
+def get_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/125.0 Safari/537.36"
+        ),
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": NSE_HOME
+    })
+    return session
 
-@st.cache_data(ttl=60)
-def get_data(interval, period):
 
-    df = yf.download(
+# =========================================================
+# NEWS INTELLIGENCE
+# =========================================================
+@st.cache_data(ttl=300, show_spinner=False)
+def get_news():
+    rows = []
+
+    for query in NEWS_QUERIES:
+        url = (
+            "https://news.google.com/rss/search?q="
+            + quote(query + " when:2d")
+            + "&hl=en-IN&gl=IN&ceid=IN:en"
+        )
+
+        try:
+            feed = feedparser.parse(url)
+
+            for item in feed.entries[:12]:
+                published = item.get("published", "")
+                title = item.get("title", "")
+                link = item.get("link", "")
+
+                if not title or not link:
+                    continue
+
+                rows.append({
+                    "Headline": title,
+                    "Published": published,
+                    "Source": item.get("source", {}).get(
+                        "title", "Google News"
+                    ),
+                    "Link": link
+                })
+
+        except Exception:
+            continue
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["Headline", "Published", "Source", "Link"]
+        )
+
+    df = pd.DataFrame(rows)
+    df = df.drop_duplicates(subset=["Headline"])
+    return df.head(60)
+
+
+POSITIVE_WORDS = [
+    "surge", "rally", "gain", "growth", "profit", "strong",
+    "bullish", "upgrade", "buy", "inflow", "record high",
+    "rate cut", "cuts rates", "easing", "positive",
+    "beats estimates", "approval", "recovery", "deal",
+    "stimulus", "support", "expansion"
+]
+
+NEGATIVE_WORDS = [
+    "crash", "fall", "falls", "decline", "loss", "weak",
+    "bearish", "downgrade", "sell", "outflow", "war",
+    "attack", "crisis", "inflation rises", "rate hike",
+    "hikes rates", "default", "recession", "fraud",
+    "sanctions", "uncertainty", "misses estimates",
+    "selloff", "sell-off", "volatility spike"
+]
+
+
+def score_news(text):
+    text = str(text).lower()
+
+    positive = sum(word in text for word in POSITIVE_WORDS)
+    negative = sum(word in text for word in NEGATIVE_WORDS)
+
+    if positive > negative:
+        return "Positive", positive - negative
+
+    if negative > positive:
+        return "Negative", negative - positive
+
+    return "Neutral", 0
+
+
+def news_summary(news):
+    if news.empty:
+        return {
+            "positive": 0,
+            "negative": 0,
+            "neutral": 0,
+            "score": 0
+        }
+
+    sentiments = news["Headline"].apply(score_news)
+
+    positive = sum(x[0] == "Positive" for x in sentiments)
+    negative = sum(x[0] == "Negative" for x in sentiments)
+    neutral = sum(x[0] == "Neutral" for x in sentiments)
+
+    total = max(len(news), 1)
+    score = (positive - negative) / total
+
+    return {
+        "positive": positive,
+        "negative": negative,
+        "neutral": neutral,
+        "score": score
+    }
+
+
+# =========================================================
+# MARKET DATA
+# =========================================================
+@st.cache_data(ttl=60, show_spinner=False)
+def get_market_data(interval):
+    period = "60d"
+
+    data = yf.download(
         "^NSEI",
         period=period,
         interval=interval,
-        auto_adjust=False,
+        auto_adjust=True,
         progress=False,
         threads=False
     )
 
-    if df.empty:
+    if data.empty:
         return pd.DataFrame()
 
-    # Handle Yahoo Finance MultiIndex columns
-    if isinstance(df.columns, pd.MultiIndex):
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
 
-        for level in range(df.columns.nlevels):
-            values = df.columns.get_level_values(level)
+    data.columns = [str(c).lower() for c in data.columns]
+    data = data.rename(columns={
+        "open": "open",
+        "high": "high",
+        "low": "low",
+        "close": "close",
+        "volume": "volume"
+    })
 
-            if "Close" in values:
-                df.columns = values
-                break
+    required = ["open", "high", "low", "close"]
 
-    required = ["Open", "High", "Low", "Close"]
-
-    if not all(col in df.columns for col in required):
+    if not all(c in data.columns for c in required):
         return pd.DataFrame()
 
-    if "Volume" not in df.columns:
-        df["Volume"] = 0
+    for c in required:
+        data[c] = pd.to_numeric(data[c], errors="coerce")
 
-    df = df.dropna(subset=required).copy()
+    if "volume" not in data.columns:
+        data["volume"] = 0
 
-    return df
+    data["volume"] = pd.to_numeric(
+        data["volume"], errors="coerce"
+    ).fillna(0)
+
+    data = data.dropna(subset=required)
+
+    # Exclude the latest possibly incomplete candle
+    if len(data) > 2:
+        data = data.iloc[:-1]
+
+    return data
 
 
-# ==========================================
-# INDICATOR CALCULATIONS
-# ==========================================
-
-def calculate_indicators(df):
-
+# =========================================================
+# TECHNICAL INDICATORS
+# =========================================================
+def add_indicators(df):
     df = df.copy()
 
-    close = df["Close"].astype(float)
-    high = df["High"].astype(float)
-    low = df["Low"].astype(float)
-    volume = df["Volume"].fillna(0).astype(float)
+    if len(df) < 30:
+        return pd.DataFrame()
 
-    # EMA
-    df["EMA9"] = close.ewm(
-        span=9, adjust=False
-    ).mean()
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
 
-    df["EMA21"] = close.ewm(
-        span=21, adjust=False
-    ).mean()
+    df["ema9"] = close.ewm(span=9, adjust=False).mean()
+    df["ema21"] = close.ewm(span=21, adjust=False).mean()
+    df["ema50"] = close.ewm(span=50, adjust=False).mean()
+    df["ema200"] = close.ewm(span=200, adjust=False).mean()
 
-    df["EMA50"] = close.ewm(
-        span=50, adjust=False
-    ).mean()
-
-    df["EMA200"] = close.ewm(
-        span=200, adjust=False
-    ).mean()
-
-    # RSI 14
     delta = close.diff()
-
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
-    avg_gain = gain.ewm(
-        alpha=1/14,
-        min_periods=14,
-        adjust=False
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1/14,
-        min_periods=14,
-        adjust=False
-    ).mean()
+    avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
+    df["rsi"] = 100 - (100 / (1 + rs))
 
-    rsi = 100 - (100 / (1 + rs))
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
 
-    rsi = rsi.mask(
-        (avg_loss == 0) & (avg_gain > 0), 100
-    )
-
-    rsi = rsi.mask(
-        (avg_gain == 0) & (avg_loss > 0), 0
-    )
-
-    df["RSI"] = rsi
-
-    # MACD
-    ema12 = close.ewm(
-        span=12, adjust=False
-    ).mean()
-
-    ema26 = close.ewm(
-        span=26, adjust=False
-    ).mean()
-
-    df["MACD"] = ema12 - ema26
-
-    df["MACD_SIGNAL"] = df["MACD"].ewm(
+    df["macd"] = ema12 - ema26
+    df["macd_signal"] = df["macd"].ewm(
         span=9, adjust=False
     ).mean()
 
-    df["MACD_HIST"] = (
-        df["MACD"] - df["MACD_SIGNAL"]
-    )
-
-    # ATR 14
     prev_close = close.shift(1)
 
     tr = pd.concat([
@@ -175,674 +273,771 @@ def calculate_indicators(df):
         (low - prev_close).abs()
     ], axis=1).max(axis=1)
 
-    df["ATR"] = tr.ewm(
-        alpha=1/14,
-        min_periods=14,
-        adjust=False
-    ).mean()
+    df["atr"] = tr.rolling(14).mean()
 
-    # SUPERTREND 10, 3
-    factor = 3.0
+    typical = (high + low + close) / 3
+    volume_sum = df["volume"].rolling(20).sum()
 
-    midpoint = (high + low) / 2
-
-    basic_upper = midpoint + factor * df["ATR"]
-    basic_lower = midpoint - factor * df["ATR"]
-
-    upper = np.full(len(df), np.nan)
-    lower = np.full(len(df), np.nan)
-    direction = np.ones(len(df), dtype=int)
-
-    close_values = close.to_numpy()
-    upper_basic = basic_upper.to_numpy()
-    lower_basic = basic_lower.to_numpy()
-    atr_values = df["ATR"].to_numpy()
-
-    for i in range(len(df)):
-
-        if not np.isfinite(atr_values[i]):
-            continue
-
-        if i == 0 or not np.isfinite(upper[i-1]):
-
-            upper[i] = upper_basic[i]
-            lower[i] = lower_basic[i]
-            direction[i] = 1
-
-            continue
-
-        upper[i] = (
-            upper_basic[i]
-            if (
-                upper_basic[i] < upper[i-1]
-                or close_values[i-1] > upper[i-1]
-            )
-            else upper[i-1]
-        )
-
-        lower[i] = (
-            lower_basic[i]
-            if (
-                lower_basic[i] > lower[i-1]
-                or close_values[i-1] < lower[i-1]
-            )
-            else lower[i-1]
-        )
-
-        if direction[i-1] == 1:
-
-            direction[i] = (
-                -1 if close_values[i] < lower[i] else 1
-            )
-
-        else:
-
-            direction[i] = (
-                1 if close_values[i] > upper[i] else -1
-            )
-
-    df["ST_DIRECTION"] = direction
-
-    df["SUPERTREND"] = np.where(
-        direction == 1, lower, upper
+    df["vwap_proxy"] = (
+        (typical * df["volume"]).rolling(20).sum()
+        / volume_sum.replace(0, np.nan)
     )
 
-    # SESSION VWAP
-    typical_price = (high + low + close) / 3
+    df["return1"] = close.pct_change()
+    df["return3"] = close.pct_change(3)
+    df["return5"] = close.pct_change(5)
+    df["volatility"] = df["return1"].rolling(20).std()
 
-    if volume.sum() > 0:
+    df["candle_body"] = (
+        (df["close"] - df["open"]) / close
+    )
+    df["candle_range"] = (
+        (df["high"] - df["low"]) / close
+    )
 
-        sessions = pd.Series(
-            df.index.date,
-            index=df.index
+    return df.replace([np.inf, -np.inf], np.nan)
+
+
+# =========================================================
+# MACHINE LEARNING
+# =========================================================
+FEATURES = [
+    "ema9", "ema21", "ema50", "ema200",
+    "rsi", "macd", "macd_signal", "atr",
+    "return1", "return3", "return5",
+    "volatility", "candle_body", "candle_range"
+]
+
+
+def train_predict(df, horizon=3):
+    result = {
+        "status": "Unavailable",
+        "direction": "NO TRADE",
+        "up": 0,
+        "down": 0,
+        "sideways": 0,
+        "accuracy": None,
+        "reasons": []
+    }
+
+    if df.empty or len(df) < 300:
+        result["reasons"].append(
+            "ML training ke liye sufficient historical candles nahi hain."
+        )
+        return result
+
+    data = df.copy()
+    future_return = (
+        data["close"].shift(-horizon) / data["close"] - 1
+    )
+
+    # ATR-based neutral zone; avoids tiny movements being treated as trends
+    threshold = (
+        data["atr"] / data["close"] * 0.25
+    ).clip(lower=0.0003)
+
+    data["target"] = np.where(
+        future_return > threshold, 1,
+        np.where(future_return < -threshold, -1, 0)
+    )
+
+    data = data.dropna(subset=FEATURES + ["target"])
+
+    if len(data) < 250:
+        result["reasons"].append("Training dataset bahut chhota hai.")
+        return result
+
+    X = data[FEATURES].replace([np.inf, -np.inf], np.nan)
+    y = data["target"].astype(int)
+
+    valid = X.notna().all(axis=1)
+    X = X.loc[valid]
+    y = y.loc[valid]
+
+    if len(X) < 250 or y.nunique() < 2:
+        result["reasons"].append(
+            "Training data mein required target classes nahi mile."
+        )
+        return result
+
+    split = int(len(X) * 0.8)
+
+    X_train, X_test = X.iloc[:split], X.iloc[split:]
+    y_train, y_test = y.iloc[:split], y.iloc[split:]
+
+    if y_train.nunique() < 2:
+        result["reasons"].append(
+            "Training period mein enough direction classes nahi hain."
+        )
+        return result
+
+    model = Pipeline([
+        ("scale", StandardScaler()),
+        ("rf", RandomForestClassifier(
+            n_estimators=250,
+            max_depth=8,
+            min_samples_leaf=8,
+            min_samples_split=20,
+            class_weight="balanced_subsample",
+            random_state=42,
+            n_jobs=-1
+        ))
+    ])
+
+    model.fit(X_train, y_train)
+
+    if len(X_test) > 0:
+        predictions = model.predict(X_test)
+        result["accuracy"] = accuracy_score(
+            y_test, predictions
         )
 
-        pv = typical_price * volume
+    latest = X.iloc[[-1]]
+    probabilities = model.predict_proba(latest)[0]
 
-        cumulative_pv = pv.groupby(sessions).cumsum()
+    classes = model.named_steps["rf"].classes_
+    prob_map = dict(zip(classes, probabilities))
 
-        cumulative_volume = (
-            volume.groupby(sessions).cumsum()
-        )
+    result["up"] = float(prob_map.get(1, 0))
+    result["down"] = float(prob_map.get(-1, 0))
+    result["sideways"] = float(prob_map.get(0, 0))
+    result["status"] = "Available"
 
-        df["VWAP"] = (
-            cumulative_pv /
-            cumulative_volume.replace(0, np.nan)
-        )
+    highest = max(
+        result["up"], result["down"], result["sideways"]
+    )
 
+    if highest < 0.50:
+        result["direction"] = "NO TRADE"
+    elif highest == result["up"]:
+        result["direction"] = "UP"
+    elif highest == result["down"]:
+        result["direction"] = "DOWN"
     else:
+        result["direction"] = "SIDEWAYS"
 
-        df["VWAP"] = np.nan
-
-    # VOLUME AVERAGE
-    df["VOL_AVG"] = volume.rolling(20).mean()
-
-    return df
+    return result
 
 
-# ==========================================
-# LOAD MARKET DATA
-# ==========================================
+# =========================================================
+# NSE OPTION CHAIN
+# =========================================================
+@st.cache_data(ttl=90, show_spinner=False)
+def get_option_chain():
+    try:
+        session = get_session()
+        session.get(NSE_HOME, timeout=10)
 
-if st.button("🔄 REFRESH MARKET DATA"):
+        response = session.get(
+            NSE_OPTION_URL,
+            timeout=15
+        )
+        response.raise_for_status()
 
+        payload = response.json()
+        records = payload.get("records", {})
+        rows = records.get("data", [])
+
+        output = []
+
+        for row in rows:
+            strike = row.get("strikePrice")
+
+            ce = row.get("CE", {})
+            pe = row.get("PE", {})
+
+            output.append({
+                "Strike": strike,
+                "CE LTP": ce.get("lastPrice"),
+                "CE OI": ce.get("openInterest"),
+                "CE Change OI": ce.get("changeinOpenInterest"),
+                "CE Volume": ce.get("totalTradedVolume"),
+                "CE IV": ce.get("impliedVolatility"),
+                "PE LTP": pe.get("lastPrice"),
+                "PE OI": pe.get("openInterest"),
+                "PE Change OI": pe.get("changeinOpenInterest"),
+                "PE Volume": pe.get("totalTradedVolume"),
+                "PE IV": pe.get("impliedVolatility")
+            })
+
+        df = pd.DataFrame(output)
+
+        if df.empty:
+            return df, "NSE returned no option data"
+
+        expiry = records.get("expiryDates", [])
+        expiry_text = expiry[0] if expiry else "Not available"
+
+        return df, "Expiry: " + str(expiry_text)
+
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
+def option_chain_analysis(options, spot):
+    if options.empty:
+        return {
+            "available": False,
+            "pcr": None,
+            "support": None,
+            "resistance": None,
+            "reason": "Option chain unavailable."
+        }
+
+    df = options.copy()
+
+    for col in [
+        "CE OI", "PE OI", "CE Change OI",
+        "PE Change OI", "Strike"
+    ]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    ce_oi = df["CE OI"].fillna(0).sum()
+    pe_oi = df["PE OI"].fillna(0).sum()
+
+    pcr = pe_oi / ce_oi if ce_oi > 0 else None
+
+    resistance_row = df.loc[df["CE OI"].idxmax()]
+    support_row = df.loc[df["PE OI"].idxmax()]
+
+    support = support_row["Strike"]
+    resistance = resistance_row["Strike"]
+
+    if pcr is None:
+        reason = "PCR calculate nahi ho saka."
+    elif pcr > 1.2:
+        reason = "PCR high: put OI comparatively zyada hai."
+    elif pcr < 0.8:
+        reason = "PCR low: call OI comparatively zyada hai."
+    else:
+        reason = "PCR neutral zone mein hai."
+
+    return {
+        "available": True,
+        "pcr": pcr,
+        "support": support,
+        "resistance": resistance,
+        "reason": reason
+    }
+
+
+# =========================================================
+# FII / DII DATA
+# =========================================================
+@st.cache_data(ttl=1800, show_spinner=False)
+def get_fii_dii():
+    try:
+        session = get_session()
+        session.get(NSE_HOME, timeout=10)
+
+        response = session.get(
+            NSE_FII_URL,
+            timeout=15
+        )
+        response.raise_for_status()
+
+        data = response.json()
+
+        if isinstance(data, dict):
+            rows = data.get("data", data.get("rows", []))
+        else:
+            rows = data
+
+        if not isinstance(rows, list) or not rows:
+            return pd.DataFrame(), "No published data returned"
+
+        return pd.DataFrame(rows), "NSE response received"
+
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
+# =========================================================
+# DECISION ENGINE
+# =========================================================
+def technical_direction(row):
+    score = 0
+    reasons = []
+
+    if row["ema9"] > row["ema21"]:
+        score += 1
+        reasons.append("EMA 9 > EMA 21: short-term bullish trend.")
+    else:
+        score -= 1
+        reasons.append("EMA 9 < EMA 21: short-term bearish trend.")
+
+    if row["close"] > row["ema50"]:
+        score += 1
+        reasons.append("Price EMA 50 ke upar hai.")
+    else:
+        score -= 1
+        reasons.append("Price EMA 50 ke neeche hai.")
+
+    if row["macd"] > row["macd_signal"]:
+        score += 1
+        reasons.append("MACD bullish crossover position mein hai.")
+    else:
+        score -= 1
+        reasons.append("MACD bearish position mein hai.")
+
+    if row["rsi"] > 55:
+        score += 1
+        reasons.append("RSI above 55: bullish momentum.")
+    elif row["rsi"] < 45:
+        score -= 1
+        reasons.append("RSI below 45: bearish momentum.")
+    else:
+        reasons.append("RSI neutral zone mein hai.")
+
+    return score, reasons
+
+
+def make_decision(
+    score5, score15, news_score, ml5, ml15,
+    option_data
+):
+    reasons = []
+    score = 0
+
+    score += score5 * 1.0
+    score += score15 * 1.5
+
+    if news_score > 0.10:
+        score += 1
+        reasons.append("News sentiment positive hai.")
+    elif news_score < -0.10:
+        score -= 1
+        reasons.append("News sentiment negative hai.")
+    else:
+        reasons.append("News sentiment neutral/mixed hai.")
+
+    if ml5["direction"] == "UP":
+        score += 1
+        reasons.append("5m ML model UP direction dikha raha hai.")
+    elif ml5["direction"] == "DOWN":
+        score -= 1
+        reasons.append("5m ML model DOWN direction dikha raha hai.")
+
+    if ml15["direction"] == "UP":
+        score += 1
+        reasons.append("15m ML model UP direction dikha raha hai.")
+    elif ml15["direction"] == "DOWN":
+        score -= 1
+        reasons.append("15m ML model DOWN direction dikha raha hai.")
+
+    if option_data["available"] and option_data["pcr"] is not None:
+        if option_data["pcr"] > 1.2:
+            score += 1
+            reasons.append("Option-chain PCR bullish side par hai.")
+        elif option_data["pcr"] < 0.8:
+            score -= 1
+            reasons.append("Option-chain PCR bearish side par hai.")
+
+    # Require multi-source confirmation
+    if (
+        score >= 3
+        and score5 > 0
+        and score15 > 0
+        and ml5["direction"] == "UP"
+        and ml15["direction"] == "UP"
+    ):
+        decision = "CE SETUP"
+    elif (
+        score <= -3
+        and score5 < 0
+        and score15 < 0
+        and ml5["direction"] == "DOWN"
+        and ml15["direction"] == "DOWN"
+    ):
+        decision = "PE SETUP"
+    else:
+        decision = "NO TRADE"
+
+    if decision == "NO TRADE":
+        reasons.append(
+            "Multiple independent confirmations nahi mile. "
+            "Capital protect karne ke liye wait."
+        )
+
+    return decision, score, reasons
+
+
+# =========================================================
+# SIDEBAR
+# =========================================================
+st.sidebar.header("⚙️ AI Settings")
+
+horizon = st.sidebar.selectbox(
+    "Prediction horizon (candles)",
+    [2, 3, 4, 5],
+    index=1
+)
+
+risk_percent = st.sidebar.slider(
+    "Illustrative risk % per trade",
+    0.25, 2.0, 0.5, 0.25
+)
+
+st.sidebar.caption(
+    "Risk % sirf planning input hai; quantity calculation ke liye "
+    "actual option premium, lot size aur broker charges zaroori hain."
+)
+
+if st.sidebar.button("🔄 Refresh all data"):
     st.cache_data.clear()
     st.rerun()
 
-try:
 
-    with st.spinner("Loading NIFTY 50 market data..."):
+# =========================================================
+# LOAD ALL DATA
+# =========================================================
+with st.spinner("Market, news aur AI data load ho raha hai..."):
+    news = get_news()
 
-        raw5 = get_data("5m", "5d")
-        raw15 = get_data("15m", "1mo")
-        raw60 = get_data("1h", "3mo")
+    raw5 = get_market_data("5m")
+    raw15 = get_market_data("15m")
 
-        if any(
-            df.empty
-            for df in [raw5, raw15, raw60]
-        ):
+    df5 = add_indicators(raw5)
+    df15 = add_indicators(raw15)
 
-            st.error(
-                "Market data unavailable. Please refresh later."
-            )
+    options, option_status = get_option_chain()
+    fii_dii, fii_status = get_fii_dii()
 
-            st.stop()
 
-        df5 = calculate_indicators(raw5)
-        df15 = calculate_indicators(raw15)
-        df60 = calculate_indicators(raw60)
-
-    # Latest available candles
-    c5 = df5.iloc[-1]
-    c15 = df15.iloc[-1]
-    c60 = df60.iloc[-1]
-
-    price = float(c5["Close"])
-    atr = float(c5["ATR"])
-    rsi = float(c5["RSI"])
-
-    if not np.isfinite(atr) or atr <= 0:
-
-        st.error("ATR data is insufficient.")
-        st.stop()
-
-    if not np.isfinite(rsi):
-
-        st.error("RSI data is insufficient.")
-        st.stop()
-
-    # ======================================
-    # SIGNAL ENGINE
-    # ======================================
-
-    buy_score = 0
-    sell_score = 0
-    max_score = 0
-
-    details = []
-
-    def add_vote(name, bullish, bearish, weight=1):
-
-        global_dummy = None
-
-        nonlocal_values = {
-            "bullish": bullish,
-            "bearish": bearish
-        }
-
-        global buy_score, sell_score, max_score
-
-        max_score += weight
-
-        if bullish:
-
-            buy_score += weight
-            result = "BULLISH"
-
-        elif bearish:
-
-            sell_score += weight
-            result = "BEARISH"
-
-        else:
-
-            result = "NEUTRAL"
-
-        details.append({
-            "Indicator": name,
-            "Signal": result,
-            "Weight": weight
-        })
-
-    # 5 MINUTE EMA TREND
-
-    ema_bull = (
-        c5["EMA9"] > c5["EMA21"]
-        and c5["EMA21"] > c5["EMA50"]
-        and c5["Close"] > c5["EMA200"]
-    )
-
-    ema_bear = (
-        c5["EMA9"] < c5["EMA21"]
-        and c5["EMA21"] < c5["EMA50"]
-        and c5["Close"] < c5["EMA200"]
-    )
-
-    add_vote(
-        "5m EMA 9/21/50/200",
-        ema_bull,
-        ema_bear,
-        2
-    )
-
-    # RSI
-
-    add_vote(
-        "RSI 14",
-        52 <= rsi < 70,
-        30 < rsi <= 48,
-        1
-    )
-
-    # MACD
-
-    add_vote(
-        "MACD",
-        c5["MACD"] > c5["MACD_SIGNAL"],
-        c5["MACD"] < c5["MACD_SIGNAL"],
-        1
-    )
-
-    # SUPERTREND
-
-    add_vote(
-        "Supertrend",
-        c5["ST_DIRECTION"] == 1,
-        c5["ST_DIRECTION"] == -1,
-        1
-    )
-
-    # VWAP
-
-    if pd.notna(c5["VWAP"]):
-
-        add_vote(
-            "VWAP",
-            price > c5["VWAP"],
-            price < c5["VWAP"],
-            1
-        )
-
-    # VOLUME
-
-    if (
-        c5["Volume"] > 0
-        and pd.notna(c5["VOL_AVG"])
-        and c5["VOL_AVG"] > 0
-    ):
-
-        volume_bull = (
-            c5["Volume"] > c5["VOL_AVG"]
-            and c5["Close"] > c5["Open"]
-        )
-
-        volume_bear = (
-            c5["Volume"] > c5["VOL_AVG"]
-            and c5["Close"] < c5["Open"]
-        )
-
-        add_vote(
-            "Volume Confirmation",
-            volume_bull,
-            volume_bear,
-            1
-        )
-
-    # 15 MINUTE EMA
-
-    add_vote(
-        "15m EMA Trend",
-        (
-            c15["EMA9"] > c15["EMA21"]
-            and c15["EMA21"] > c15["EMA50"]
-        ),
-        (
-            c15["EMA9"] < c15["EMA21"]
-            and c15["EMA21"] < c15["EMA50"]
-        ),
-        2
-    )
-
-    # 15 MINUTE SUPERTREND
-
-    add_vote(
-        "15m Supertrend",
-        c15["ST_DIRECTION"] == 1,
-        c15["ST_DIRECTION"] == -1,
-        1
-    )
-
-    # 1 HOUR EMA
-
-    add_vote(
-        "1H EMA Trend",
-        (
-            c60["EMA9"] > c60["EMA21"]
-            and c60["EMA21"] > c60["EMA50"]
-        ),
-        (
-            c60["EMA9"] < c60["EMA21"]
-            and c60["EMA21"] < c60["EMA50"]
-        ),
-        2
-    )
-
-    # 1 HOUR SUPERTREND
-
-    add_vote(
-        "1H Supertrend",
-        c60["ST_DIRECTION"] == 1,
-        c60["ST_DIRECTION"] == -1,
-        1
-    )
-
-    # ======================================
-    # FINAL SIGNAL
-    # ======================================
-
-    buy_ratio = buy_score / max_score
-    sell_ratio = sell_score / max_score
-
-    required_score = signal_threshold / 100
-
-    required_gap = 0.20
-
-    if (
-        buy_ratio >= required_score
-        and buy_ratio - sell_ratio >= required_gap
-    ):
-
-        signal = "STRONG BUY"
-
-    elif (
-        sell_ratio >= required_score
-        and sell_ratio - buy_ratio >= required_gap
-    ):
-
-        signal = "STRONG SELL"
-
-    else:
-
-        signal = "NO TRADE"
-
-    agreement = max(buy_ratio, sell_ratio) * 100
-
-    # ======================================
-    # MAIN DASHBOARD
-    # ======================================
-
-    st.divider()
-
-    st.subheader("📊 LIVE MARKET OVERVIEW")
-
-    a, b, c, d = st.columns(4)
-
-    a.metric(
-        "NIFTY 50",
-        f"{price:,.2f}"
-    )
-
-    b.metric(
-        "RSI 14",
-        f"{rsi:.2f}"
-    )
-
-    c.metric(
-        "ATR 14",
-        f"{atr:.2f}"
-    )
-
-    d.metric(
-        "MACD",
-        f"{c5['MACD']:.2f}"
-    )
-
-    st.divider()
-
-    st.subheader("🤖 PRO SIGNAL PREDICTION")
-
-    if signal == "STRONG BUY":
-
-        st.success("🟢 STRONG BUY")
-
-    elif signal == "STRONG SELL":
-
-        st.error("🔴 STRONG SELL")
-
-    else:
-
-        st.warning("🟡 NO TRADE — WAIT")
-
-    st.metric(
-        "Indicator Agreement (NOT win probability)",
-        f"{agreement:.1f}%"
-    )
-
-    st.progress(
-        min(1.0, agreement / 100)
-    )
-
-    x, y = st.columns(2)
-
-    x.metric(
-        "BUY SCORE",
-        f"{buy_score}/{max_score}"
-    )
-
-    y.metric(
-        "SELL SCORE",
-        f"{sell_score}/{max_score}"
-    )
-
-    st.divider()
-
-    # ======================================
-    # INDICATOR TABLE
-    # ======================================
-
-    st.subheader("🔍 INDICATOR CONFIRMATION")
-
-    detail_df = pd.DataFrame(details)
-
-    st.dataframe(
-        detail_df,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ======================================
-    # TRADE CALCULATOR
-    # ======================================
-
-    st.divider()
-
-    st.subheader("🎯 ENTRY / SL / TARGET CALCULATOR")
-
-    trade_mode = st.selectbox(
-        "Select Trading Mode",
-        [
-            "Automatic Strategy Signal",
-            "Manual BUY",
-            "Manual SELL"
-        ]
-    )
-
-    if trade_mode == "Automatic Strategy Signal":
-
-        trade_side = signal
-
-    elif trade_mode == "Manual BUY":
-
-        trade_side = "BUY"
-
-    else:
-
-        trade_side = "SELL"
-
-    entry = st.number_input(
-        "Entry Price",
-        min_value=0.05,
-        value=round(price, 2),
-        step=0.05
-    )
-
-    atr_multiplier = sl_multiplier
-
-    if trade_side in ["STRONG BUY", "BUY"]:
-
-        risk = atr * atr_multiplier
-
-        stop_loss = entry - risk
-
-        target1 = entry + risk
-        target2 = entry + (risk * 2)
-        target3 = entry + (risk * 3)
-
-    elif trade_side in ["STRONG SELL", "SELL"]:
-
-        risk = atr * atr_multiplier
-
-        stop_loss = entry + risk
-
-        target1 = entry - risk
-        target2 = entry - (risk * 2)
-        target3 = entry - (risk * 3)
-
-    else:
-
-        risk = None
-        stop_loss = None
-        target1 = None
-        target2 = None
-        target3 = None
-
-    if risk is not None:
-
-        st.write(
-            f"Selected Trade: **{trade_side}**"
-        )
-
-        p1, p2 = st.columns(2)
-
-        p1.metric(
-            "ENTRY PRICE",
-            f"{entry:,.2f}"
-        )
-
-        p2.metric(
-            "STOP LOSS",
-            f"{stop_loss:,.2f}"
-        )
-
-        t1, t2, t3 = st.columns(3)
-
-        t1.metric(
-            "TARGET 1 (1R)",
-            f"{target1:,.2f}"
-        )
-
-        t2.metric(
-            "TARGET 2 (2R)",
-            f"{target2:,.2f}"
-        )
-
-        t3.metric(
-            "TARGET 3 (3R)",
-            f"{target3:,.2f}"
-        )
-
-        st.info(
-            f"Risk Distance: {risk:.2f} NIFTY points"
-        )
-
-    else:
-
-        st.warning(
-            "No valid automatic trade signal. "
-            "Wait for market confirmation or select manual trade."
-        )
-
-    # ======================================
-    # CHART
-    # ======================================
-
-    st.divider()
-
-    st.subheader("📈 NIFTY 50 PRICE CHART")
-
-    chart = df5[
-        ["Close", "EMA9", "EMA21", "EMA50"]
-    ].tail(100)
-
-    st.line_chart(chart)
-
-    # ======================================
-    # TIMEFRAME SUMMARY
-    # ======================================
-
-    st.divider()
-
-    st.subheader("⏱️ MULTI-TIMEFRAME ANALYSIS")
-
-    timeframe_data = pd.DataFrame([
-        {
-            "Timeframe": "5 Minutes",
-            "EMA Trend": (
-                "Bullish" if c5["EMA9"] > c5["EMA21"]
-                else "Bearish"
-            ),
-            "Supertrend": (
-                "Bullish" if c5["ST_DIRECTION"] == 1
-                else "Bearish"
-            )
-        },
-        {
-            "Timeframe": "15 Minutes",
-            "EMA Trend": (
-                "Bullish" if c15["EMA9"] > c15["EMA21"]
-                else "Bearish"
-            ),
-            "Supertrend": (
-                "Bullish" if c15["ST_DIRECTION"] == 1
-                else "Bearish"
-            )
-        },
-        {
-            "Timeframe": "1 Hour",
-            "EMA Trend": (
-                "Bullish" if c60["EMA9"] > c60["EMA21"]
-                else "Bearish"
-            ),
-            "Supertrend": (
-                "Bullish" if c60["ST_DIRECTION"] == 1
-                else "Bearish"
-            )
-        }
-    ])
-
-    st.dataframe(
-        timeframe_data,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    # ======================================
-    # RECENT DATA
-    # ======================================
-
-    with st.expander("📋 Recent Market Candles"):
-
-        st.dataframe(
-            df5[
-                [
-                    "Open",
-                    "High",
-                    "Low",
-                    "Close",
-                    "EMA9",
-                    "EMA21",
-                    "RSI",
-                    "MACD",
-                    "ATR"
-                ]
-            ].tail(30),
-            use_container_width=True
-        )
-
-    # ======================================
-    # DISCLAIMER
-    # ======================================
-
-    st.caption(
-        "Market data source: Yahoo Finance (^NSEI). "
-        "Intraday data can be delayed and the latest candle may be incomplete."
-    )
-
-    st.warning(
-        "IMPORTANT: This is an experimental indicator-based analysis tool. "
-        "Agreement score is not a probability of winning. "
-        "No strategy guarantees accurate predictions or profits. "
-        "Backtest and paper trade before using real money. "
-        "NIFTY index points are not option premiums."
-    )
-
-except Exception as e:
-
+if df5.empty or df15.empty:
     st.error(
-        f"Application Error: {str(e)}"
+        "Market data available nahi hai. Yahoo Finance data "
+        "temporarily unavailable ho sakta hai. Kuch der baad refresh karein."
+    )
+    st.stop()
+
+
+# =========================================================
+# CALCULATE
+# =========================================================
+last5 = df5.iloc[-1]
+last15 = df15.iloc[-1]
+
+spot = float(last5["close"])
+
+ml5 = train_predict(df5, horizon)
+ml15 = train_predict(df15, horizon)
+
+score5, reasons5 = technical_direction(last5)
+score15, reasons15 = technical_direction(last15)
+
+news_stats = news_summary(news)
+
+option_analysis = option_chain_analysis(options, spot)
+
+decision, decision_score, decision_reasons = make_decision(
+    score5, score15, news_stats["score"],
+    ml5, ml15, option_analysis
+)
+
+
+# =========================================================
+# TOP MARKET SUMMARY
+# ========================
+# =========================================================
+# FINAL TRADE DECISION
+# =========================================================
+st.divider()
+st.subheader("2. AI Final Trade Decision")
+
+if decision == "CE SETUP":
+    st.success("🟢 CE SETUP — bullish confirmations")
+elif decision == "PE SETUP":
+    st.error("🔴 PE SETUP — bearish confirmations")
+else:
+    st.warning("🟡 NO TRADE — confirmation incomplete")
+
+st.write("**Decision score:**", decision_score)
+
+for reason in decision_reasons:
+    st.write("•", reason)
+
+st.info(
+    "CE/PE SETUP guaranteed buy signal nahi hai. "
+    "Entry se pehle option premium, spread, expiry, IV aur liquidity verify karein."
+)
+
+# =========================================================
+# WHY THIS TRADE?
+# =========================================================
+st.divider()
+st.subheader("3. Trade Reasoning — Why / Why Not")
+
+left, right = st.columns(2)
+
+with left:
+    st.markdown("### 5-minute technical reasons")
+    for reason in reasons5:
+        st.write("•", reason)
+
+    st.markdown("### 5-minute ML")
+    st.write("Direction:", ml5["direction"])
+    st.write("UP:", f"{ml5['up']:.1%}")
+    st.write("DOWN:", f"{ml5['down']:.1%}")
+    st.write("SIDEWAYS:", f"{ml5['sideways']:.1%}")
+
+with right:
+    st.markdown("### 15-minute technical reasons")
+    for reason in reasons15:
+        st.write("•", reason)
+
+    st.markdown("### 15-minute ML")
+    st.write("Direction:", ml15["direction"])
+    st.write("UP:", f"{ml15['up']:.1%}")
+    st.write("DOWN:", f"{ml15['down']:.1%}")
+    st.write("SIDEWAYS:", f"{ml15['sideways']:.1%}")
+
+# =========================================================
+# ML MODEL PERFORMANCE
+# =========================================================
+st.divider()
+st.subheader("4. Machine Learning Evaluation")
+
+m1, m2 = st.columns(2)
+
+with m1:
+    if ml5["accuracy"] is not None:
+        st.metric(
+            "5m chronological holdout accuracy",
+            f"{ml5['accuracy']:.1%}"
+        )
+    else:
+        st.write("5m accuracy unavailable")
+
+with m2:
+    if ml15["accuracy"] is not None:
+        st.metric(
+            "15m chronological holdout accuracy",
+            f"{ml15['accuracy']:.1%}"
+        )
+    else:
+        st.write("15m accuracy unavailable")
+
+st.caption(
+    "Ye classification accuracy hai, trading win rate nahi. "
+    "Model probabilities calibrated profit probabilities nahi hain. "
+    "Transaction costs aur slippage wala walk-forward backtest "
+    "abhi included nahi hai."
+)
+
+# =========================================================
+# NEWS INTELLIGENCE
+# =========================================================
+st.divider()
+st.subheader("5. News Intelligence & Market Sentiment")
+
+n1, n2, n3, n4 = st.columns(4)
+
+n1.metric("Positive headlines", news_stats["positive"])
+n2.metric("Negative headlines", news_stats["negative"])
+n3.metric("Neutral headlines", news_stats["neutral"])
+n4.metric("Sentiment score", f"{news_stats['score']:.2f}")
+
+if news.empty:
+    st.warning("News feed unavailable. News sentiment ko neutral assume na karein.")
+else:
+    display_news = news.copy()
+    display_news["Sentiment"] = display_news["Headline"].apply(
+        lambda x: score_news(x)[0]
     )
 
-    st.info(
-        "Check internet connection, data availability "
-        "and installed package versions. Then refresh the app."
+    for _, row in display_news.iterrows():
+        with st.container(border=True):
+            st.markdown(f"**{row['Headline']}**")
+            st.caption(
+                f"{row['Source']} | {row['Published']} | "
+                f"Sentiment: {row['Sentiment']}"
+            )
+            st.markdown(f"[Open original news]({row['Link']})")
+
+st.caption(
+    "Headline sentiment basic keyword analysis hai. "
+    "Headline ka sentiment actual market impact ki guarantee nahi hai."
+)
+
+# =========================================================
+# OPTION CHAIN
+# =========================================================
+st.divider()
+st.subheader("6. NIFTY Option Chain — CE / PE")
+
+st.write("**Option-chain status:**", option_status)
+
+if option_analysis["available"]:
+    o1, o2, o3 = st.columns(3)
+
+    o1.metric(
+        "PCR",
+        f"{option_analysis['pcr']:.2f}"
+        if option_analysis["pcr"] is not None else "N/A"
     )
+    o2.metric(
+        "Highest Put OI strike",
+        str(option_analysis["support"])
+    )
+    o3.metric(
+        "Highest Call OI strike",
+        str(option_analysis["resistance"])
+    )
+
+    st.write("**Interpretation:**", option_analysis["reason"])
+
+    st.dataframe(
+        options.sort_values("Strike"),
+        use_container_width=True,
+        hide_index=True
+    )
+else:
+    st.warning(
+        "NSE option chain fetch nahi ho payi. "
+        "Is condition mein option data ko live maan kar trade nahi lena."
+    )
+
+st.markdown(
+    "[Open official NSE option chain](https://www.nseindia.com/option-chain)"
+)
+
+# =========================================================
+# FII / DII
+# =========================================================
+st.divider()
+st.subheader("7. FII / DII Institutional Activity")
+
+st.write("**FII/DII source status:**", fii_status)
+
+if not fii_dii.empty:
+    st.dataframe(
+        fii_dii,
+        use_container_width=True,
+        hide_index=True
+    )
+else:
+    st.warning(
+        "FII/DII data automatically retrieve nahi ho paya. "
+        "Published exchange data generally end-of-day hota hai."
+    )
+
+st.markdown(
+    "[NSE official FII/DII reports](https://www.nseindia.com/reports/fii-dii)"
+)
+
+# =========================================================
+# TECHNICAL CHART
+# =========================================================
+st.divider()
+st.subheader("8. NIFTY Technical Chart")
+
+chart = go.Figure()
+
+chart.add_trace(go.Candlestick(
+    x=df5.index,
+    open=df5["open"],
+    high=df5["high"],
+    low=df5["low"],
+    close=df5["close"],
+    name="NIFTY 5m"
+))
+
+chart.add_trace(go.Scatter(
+    x=df5.index,
+    y=df5["ema9"],
+    name="EMA 9",
+    line=dict(width=1)
+))
+
+chart.add_trace(go.Scatter(
+    x=df5.index,
+    y=df5["ema21"],
+    name="EMA 21",
+    line=dict(width=1)
+))
+
+chart.add_trace(go.Scatter(
+    x=df5.index,
+    y=df5["ema50"],
+    name="EMA 50",
+    line=dict(width=1)
+))
+
+chart.update_layout(
+    height=600,
+    xaxis_rangeslider_visible=False,
+    template="plotly_dark",
+    yaxis_title="NIFTY Index",
+    xaxis_title="Time"
+)
+
+st.plotly_chart(chart, use_container_width=True)
+
+# =========================================================
+# INDICATOR DASHBOARD
+# =========================================================
+st.subheader("9. Indicator Dashboard")
+
+indicator_table = pd.DataFrame({
+    "Indicator": [
+        "EMA 9", "EMA 21", "EMA 50", "EMA 200",
+        "RSI", "MACD", "MACD Signal", "ATR",
+        "VWAP proxy"
+    ],
+    "5 Minute": [
+        last5["ema9"], last5["ema21"],
+        last5["ema50"], last5["ema200"],
+        last5["rsi"], last5["macd"],
+        last5["macd_signal"], last5["atr"],
+        last5["vwap_proxy"]
+    ],
+    "15 Minute": [
+        last15["ema9"], last15["ema21"],
+        last15["ema50"], last15["ema200"],
+        last15["rsi"], last15["macd"],
+        last15["macd_signal"], last15["atr"],
+        last15["vwap_proxy"]
+    ]
+})
+
+st.dataframe(
+    indicator_table.round(2),
+    use_container_width=True,
+    hide_index=True
+)
+
+# =========================================================
+# DATA SOURCES
+# =========================================================
+st.divider()
+st.subheader("10. Data Sources & Verification")
+
+sources = [
+    ("NSE India", "https://www.nseindia.com/"),
+    ("NSE Option Chain", "https://www.nseindia.com/option-chain"),
+    ("NSE FII/DII Reports", "https://www.nseindia.com/reports/fii-dii"),
+    ("RBI", "https://www.rbi.org.in/"),
+    ("SEBI", "https://www.sebi.gov.in/"),
+    ("Yahoo Finance NIFTY", "https://finance.yahoo.com/quote/%5ENSEI/"),
+    ("Google News", "https://news.google.com/")
+]
+
+for name, url in sources:
+    st.markdown(f"- [{name}]({url})")
+
+# =========================================================
+# FOOTER
+# =========================================================
+st.divider()
+
+st.warning(
+    "RISK WARNING: Ye educational research dashboard hai, "
+    "guaranteed trading system nahi. Options mein poora premium "
+    "loss ho sakta hai. Real capital se pehle paper trading karein."
+)
+
+st.caption(
+    "NIFTY AI Intelligence Terminal | Last refresh: "
+    + datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+)
