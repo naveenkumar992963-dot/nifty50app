@@ -1,4 +1,9 @@
+with st.sidebar:
+    st.subheader("Dashboard Controls")
 
+    if st.button("🔄 Refresh Data", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
 # ============================================================
 # NIFTY AI ULTIMATE DASHBOARD
 # PART 1 OF 2
