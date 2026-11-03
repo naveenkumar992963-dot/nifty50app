@@ -369,7 +369,140 @@ try:
         )
         st.stop()
 
-    signal, reasons = final_signal(a3, a5, a15)
+    # ==========================================
+# FINAL SIGNAL WITH MOMENTUM CONFIRMATION
+# ==========================================
+
+signal, reasons = final_signal(a3, a5, a15)
+
+# RSI confirmation
+rsi_values = [
+    a3["rsi"],
+    a5["rsi"],
+    a15["rsi"]
+]
+
+rsi_bull_count = sum(x > 50 for x in rsi_values)
+rsi_bear_count = sum(x < 50 for x in rsi_values)
+
+# MACD confirmation
+macd_bull_count = sum([
+    a3["macd_bullish"],
+    a5["macd_bullish"],
+    a15["macd_bullish"]
+])
+
+macd_bear_count = sum([
+    a3["macd_bearish"],
+    a5["macd_bearish"],
+    a15["macd_bearish"]
+])
+
+# VWAP calculation (only if valid volume exists)
+vwap_available = False
+vwap_bull = False
+vwap_bear = False
+
+volume_available = False
+volume_confirmed = False
+
+vwap_data = df3.copy()
+
+vwap_data["Volume"] = pd.to_numeric(
+    vwap_data["Volume"], errors="coerce"
+).fillna(0)
+
+if (vwap_data["Volume"] > 0).any():
+
+    typical_price = (
+        vwap_data["High"] +
+        vwap_data["Low"] +
+        vwap_data["Close"]
+    ) / 3
+
+    session_date = pd.Series(
+        vwap_data.index.date,
+        index=vwap_data.index
+    )
+
+    cumulative_pv = (
+        typical_price * vwap_data["Volume"]
+    ).groupby(session_date).cumsum()
+
+    cumulative_volume = (
+        vwap_data["Volume"]
+    ).groupby(session_date).cumsum()
+
+    vwap_data["VWAP"] = (
+        cumulative_pv / cumulative_volume.replace(0, np.nan)
+    )
+
+    current_vwap = vwap_data["VWAP"].iloc[-1]
+
+    if pd.notna(current_vwap):
+        vwap_available = True
+        vwap_bull = a3["price"] > current_vwap
+        vwap_bear = a3["price"] < current_vwap
+
+    vwap_data["Volume_AVG"] = (
+        vwap_data["Volume"].rolling(20).mean()
+    )
+
+    avg_volume = vwap_data["Volume_AVG"].iloc[-1]
+    current_volume = vwap_data["Volume"].iloc[-1]
+
+    if pd.notna(avg_volume) and avg_volume > 0:
+        volume_available = True
+        volume_confirmed = current_volume > avg_volume
+
+# Confirmation score
+if signal == "BUY":
+
+    score = (
+        (rsi_bull_count >= 2) +
+        (macd_bull_count >= 2) +
+        (vwap_available and vwap_bull) +
+        (volume_available and volume_confirmed)
+    )
+
+    if score < 2:
+        signal = "NO TRADE"
+        reasons.append(
+            "BUY rejected: momentum confirmation insufficient."
+        )
+    else:
+        reasons.append(
+            f"Bullish confirmation score: {score}/4"
+        )
+
+elif signal == "SELL":
+
+    score = (
+        (rsi_bear_count >= 2) +
+        (macd_bear_count >= 2) +
+        (vwap_available and vwap_bear) +
+        (volume_available and volume_confirmed)
+    )
+
+    if score < 2:
+        signal = "NO TRADE"
+        reasons.append(
+            "SELL rejected: momentum confirmation insufficient."
+        )
+    else:
+        reasons.append(
+            f"Bearish confirmation score: {score}/4"
+        )
+
+else:
+    score = 0
+
+# Data availability
+if not vwap_available:
+    reasons.append("VWAP unavailable: volume data missing.")
+
+if not volume_available:
+    reasons.append("Volume confirmation unavailable.")
 
 except Exception as error:
     st.error(f"Dashboard error: {error}")
