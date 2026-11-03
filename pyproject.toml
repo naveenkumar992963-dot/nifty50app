@@ -1,8 +1,8 @@
 
 [project]
-name = "nifty-ai-intelligence-terminal"
-version = "3.0.0"
-description = "NIFTY 50 News Intelligence and ML Dashboard"
+name = "nifty-ai-ultimate-terminal"
+version = "4.0.0"
+description = "NIFTY AI News, Options and ML Trading Dashboard"
 requires-python = ">=3.11,<3.14"
 
 dependencies = [
