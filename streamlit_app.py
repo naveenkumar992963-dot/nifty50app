@@ -665,3 +665,128 @@ if "option_chain" in locals() and "final_signal" in locals():
 
 else:
     st.warning("Option chain data or signal variable not found.")
+# ==========================================
+# ADDITIONAL MARKET CONFIRMATION ANALYSIS
+# Paste at the very bottom of your existing code
+# ==========================================
+
+st.divider()
+st.subheader("📊 Advanced Market Confirmation")
+
+# VWAP calculation
+vwap_data = df3.copy()
+
+typical_price = (
+    vwap_data["High"] +
+    vwap_data["Low"] +
+    vwap_data["Close"]
+) / 3
+
+volume_sum = vwap_data["Volume"].cumsum()
+
+vwap_data["VWAP"] = (
+    (typical_price * vwap_data["Volume"]).cumsum()
+    / volume_sum.replace(0, np.nan)
+)
+
+last = vwap_data.iloc[-1]
+
+# Volume average
+vwap_data["Volume_AVG"] = (
+    vwap_data["Volume"].rolling(20).mean()
+)
+
+last_volume = float(last["Volume"])
+avg_volume = float(last["Volume_AVG"])
+
+# Confirmation conditions
+rsi_bull = a3["rsi"] > 50
+rsi_bear = a3["rsi"] < 50
+
+macd_bull = a3["macd_bullish"]
+macd_bear = a3["macd_bearish"]
+
+vwap_bull = (
+    float(last["Close"]) > float(last["VWAP"])
+)
+
+vwap_bear = (
+    float(last["Close"]) < float(last["VWAP"])
+)
+
+volume_confirmed = (
+    last_volume > avg_volume
+    if pd.notna(avg_volume)
+    else False
+)
+
+# Display confirmation table
+confirmation_table = pd.DataFrame([
+    {
+        "Indicator": "RSI",
+        "Value": round(a3["rsi"], 2),
+        "Status": "Bullish" if rsi_bull else (
+            "Bearish" if rsi_bear else "Neutral"
+        )
+    },
+    {
+        "Indicator": "MACD",
+        "Value": round(
+            float(df3["MACD"].iloc[-1]), 2
+        ),
+        "Status": "Bullish" if macd_bull else "Bearish"
+    },
+    {
+        "Indicator": "VWAP",
+        "Value": round(float(last["VWAP"]), 2),
+        "Status": "Bullish" if vwap_bull else "Bearish"
+    },
+    {
+        "Indicator": "Volume",
+        "Value": round(last_volume, 0),
+        "Status": "Confirmed" if volume_confirmed else "Weak"
+    }
+])
+
+st.dataframe(
+    confirmation_table,
+    use_container_width=True,
+    hide_index=True
+)
+
+# Confirmation score
+if signal == "BUY":
+    score = sum([
+        rsi_bull,
+        macd_bull,
+        vwap_bull,
+        volume_confirmed
+    ])
+
+elif signal == "SELL":
+    score = sum([
+        rsi_bear,
+        macd_bear,
+        vwap_bear,
+        volume_confirmed
+    ])
+
+else:
+    score = 0
+
+st.metric(
+    "Additional Confirmation Score",
+    f"{score}/4"
+)
+
+if score >= 3:
+    st.success("Strong additional confirmation")
+elif score == 2:
+    st.warning("Moderate additional confirmation")
+else:
+    st.info("Weak additional confirmation")
+
+st.caption(
+    "Additional confirmation only. This score does not guarantee "
+    "profit and does not modify the original trading signal."
+    )
