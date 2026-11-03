@@ -415,29 +415,7 @@ def live_dashboard():
             payouts.append(call_loss.sum()+put_loss.sum())
         return float(strikes[int(np.argmin(payouts))])
 
-    # Option premium levels are distinct from NIFTY index levels.
-    option_entry=option_sl=option_t1=option_t2=option_rr=None
-    if candidate is not None and signal in ("BUY","SELL"):
-        side_name="CE" if signal=="BUY" else "PE"
-        option_entry=float(candidate[f"{side_name} LTP"])
-        # Conservative premium-risk template; calibrate with historical option backtests before use.
-        option_sl=max(0.05,option_entry*0.70)
-        option_t1=option_entry*1.30
-        option_t2=option_entry*1.60
-        option_risk=option_entry-option_sl
-        option_rr=(option_t1-option_entry)/option_risk if option_risk>0 else None
-        st.subheader("Final Option Trade Plan")
-        p1,p2,p3,p4,p5=st.columns(5)
-        p1.metric("Selection",side_name)
-        p2.metric("Option entry",f"₹{option_entry:.2f}")
-        p3.metric("Option stop loss",f"₹{option_sl:.2f}")
-        p4.metric("Target 1 / 2",f"₹{option_t1:.2f} / ₹{option_t2:.2f}")
-        p5.metric("Risk : Reward",f"1 : {option_rr:.2f}" if option_rr is not None else "N/A")
-        st.caption("Option levels are illustrative premium-based levels from the current chain snapshot; spread, slippage, IV crush and lot size are not modelled.")
-    else:
-        st.subheader("Final Option Trade Plan")
-        st.info("NO TRADE or no valid option contract: CE/PE, premium entry, SL, targets and R:R are withheld.")
-          # -------------------- PAPER TRADING --------------------
+    # -------------------- PAPER TRADING --------------------
     def save_close(exit_px, reason):
         t=st.session_state.open_paper
         if not t: return
@@ -511,8 +489,7 @@ def live_dashboard():
         agreement=sum(weights[k] for k,v in scores.items() if (v>0 and final_score>0) or (v<0 and final_score<0))
         confidence=clamp(abs(final_score)*0.75+agreement*0.25,0,1)*100
         return scores,weights,final_score,confidence
-
-    # -------------------- FETCH & PROCESS --------------------
+        # -------------------- FETCH & PROCESS --------------------
     try:
         now=datetime.now(IST)
         from_date=(now.date()-timedelta(days=25)).isoformat()
@@ -666,7 +643,8 @@ def live_dashboard():
     for r in reasons: st.write("• "+r)
     if ml_model is not None:
         st.caption(f"ML model estimate: {ml_metrics['p_up']*100:.1f}% Up / {(1-ml_metrics['p_up'])*100:.1f}% Down. Holdout accuracy: {ml_metrics['accuracy']*100:.1f}%.")
-        # -------------------- OPTION BUYING CANDIDATE --------------------
+
+    # -------------------- OPTION BUYING CANDIDATE --------------------
     st.subheader("CE / PE Paper-Buy Candidate")
     candidate=None
     if not chain.empty and signal in ("BUY","SELL"):
@@ -688,7 +666,29 @@ def live_dashboard():
     else:
         st.info("Option candidate तभी बनेगा जब NIFTY directional signal और usable option chain दोनों उपलब्ध हों.")
 
-    # -------------------- LEVELS & RISK --------------------
+    # Option premium levels are distinct from NIFTY index levels.
+    option_entry=option_sl=option_t1=option_t2=option_rr=None
+    if candidate is not None and signal in ("BUY","SELL"):
+        side_name="CE" if signal=="BUY" else "PE"
+        option_entry=float(candidate[f"{side_name} LTP"])
+        # Conservative premium-risk template; calibrate with historical option backtests before use.
+        option_sl=max(0.05,option_entry*0.70)
+        option_t1=option_entry*1.30
+        option_t2=option_entry*1.60
+        option_risk=option_entry-option_sl
+        option_rr=(option_t1-option_entry)/option_risk if option_risk>0 else None
+        st.subheader("Final Option Trade Plan")
+        p1,p2,p3,p4,p5=st.columns(5)
+        p1.metric("Selection",side_name)
+        p2.metric("Option entry",f"₹{option_entry:.2f}")
+        p3.metric("Option stop loss",f"₹{option_sl:.2f}")
+        p4.metric("Target 1 / 2",f"₹{option_t1:.2f} / ₹{option_t2:.2f}")
+        p5.metric("Risk : Reward",f"1 : {option_rr:.2f}" if option_rr is not None else "N/A")
+        st.caption("Option levels are illustrative premium-based levels from the current chain snapshot; spread, slippage, IV crush and lot size are not modelled.")
+    else:
+        st.subheader("Final Option Trade Plan")
+        st.info("NO TRADE or no valid option contract: CE/PE, premium entry, SL, targets and R:R are withheld.")
+# -------------------- LEVELS & RISK --------------------
     st.divider()
     st.subheader("Risk & Index Levels (Research only)")
     entry=spot
@@ -787,7 +787,8 @@ def live_dashboard():
         b.metric("Profit factor",f"{pf:.2f}" if np.isfinite(pf) else "N/A")
         c.metric("Closed trades",str(total))
     else: st.info("No closed paper trades yet.")
-        # -------------------- BACKTEST (SIMPLE, NON-OVERLAPPING SIGNAL STUDY) --------------------
+
+    # -------------------- BACKTEST (SIMPLE, NON-OVERLAPPING SIGNAL STUDY) --------------------
     st.divider()
     st.subheader("Historical Signal Study (5-minute bars)")
     st.caption("A simple chronological, non-overlapping research simulation using trend filters. Excludes brokerage, slippage and taxes; not a live execution backtest.")
@@ -803,8 +804,7 @@ def live_dashboard():
         st.write(f"Signals: **{len(active)}** | Hit ratio: **{wins/len(active)*100:.1f}%** | Mean return per signal: **{active.strategy_ret.mean()*100:.3f}%**")
         st.caption("Signals can overlap and use close-to-close returns; this is a screening study, not a fully costed portfolio backtest.")
     else: st.info("Historical signal sample अभी पर्याप्त नहीं है.")
-
-    # -------------------- CHARTS --------------------
+        # -------------------- CHARTS --------------------
     st.divider()
     st.subheader("NIFTY 3-minute Price & Indicators")
     fig=go.Figure()
@@ -837,3 +837,4 @@ def live_dashboard():
 
 
 live_dashboard()
+
