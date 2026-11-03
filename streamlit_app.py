@@ -1,12 +1,18 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import yfinance as yf
+import requests
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from urllib.parse import quote
+from streamlit_autorefresh import st_autorefresh
 import plotly.graph_objects as go
 
 st.set_page_config(page_title="NIFTY Multi-Timeframe Paper Trading", page_icon="📈", layout="wide")
 st.title("📈 NIFTY 50 Multi-Timeframe Trading System")
 st.caption("3M + 5M + 15M | EMA + RSI + MACD + Supertrend | Paper Trading (index-point simulation)")
+
+st_autorefresh(interval=15000, key="upstox_auto_refresh")
 
 # ---------------- SESSION STATE ----------------
 if "paper_balance" not in st.session_state:
@@ -31,25 +37,113 @@ with st.sidebar:
     if st.button("🔄 REFRESH DATA", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
-    st.caption("Source: Yahoo Finance; data may be delayed.")
+    st.caption("Source: Upstox API V3 | 1-minute candle polling")
     st.caption("No broker orders are sent.")
 
 # ---------------- DATA ----------------
-@st.cache_data(ttl=60)
+IST = ZoneInfo("Asia/Kolkata")
+UPSTOX_BASE = "https://api.upstox.com"
+
+def get_upstox_token():
+    try:
+        return str(st.secrets["UPSTOX_ACCESS_TOKEN"]).strip()
+    except Exception:
+        return ""
+
+def get_instrument_key():
+    try:
+        return str(st.secrets.get("UPSTOX_INSTRUMENT_KEY", "NSE_INDEX|Nifty 50")).strip()
+    except Exception:
+        return "NSE_INDEX|Nifty 50"
+
+def candles_to_frame(candles):
+    """Convert Upstox V3 candle arrays to a timezone-aware OHLCV DataFrame."""
+    rows = []
+    for candle in candles or []:
+        if len(candle) >= 6:
+            rows.append([candle[0], candle[1], candle[2], candle[3], candle[4], candle[5]])
+
+    if not rows:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
+    frame = pd.DataFrame(
+        rows, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"]
+    )
+    frame["Timestamp"] = pd.to_datetime(frame["Timestamp"], errors="coerce")
+    frame = frame.dropna(subset=["Timestamp"])
+
+    if frame["Timestamp"].dt.tz is None:
+        frame["Timestamp"] = frame["Timestamp"].dt.tz_localize("Asia/Kolkata")
+    else:
+        frame["Timestamp"] = frame["Timestamp"].dt.tz_convert("Asia/Kolkata")
+
+    frame = frame.set_index("Timestamp").sort_index()
+    for column in ["Open", "High", "Low", "Close", "Volume"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame.dropna(subset=["Open", "High", "Low", "Close"])
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_previous_sessions(token, instrument_key, from_date, to_date):
+    """Fetch recent 1m history to warm up EMA50 on the 15m timeframe."""
+    encoded_key = quote(instrument_key, safe="")
+    url = (
+        f"{UPSTOX_BASE}/v3/historical-candle/{encoded_key}/"
+        f"minutes/1/{to_date}/{from_date}"
+    )
+    response = requests.get(
+        url,
+        headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
+        timeout=20
+    )
+    if response.status_code == 401:
+        raise RuntimeError("Upstox token invalid/expired. नया Analytics Token बनाकर Streamlit Secrets update करो.")
+    response.raise_for_status()
+    return candles_to_frame(response.json().get("data", {}).get("candles", []))
+
+@st.cache_data(ttl=12, show_spinner=False)
+def get_today_intraday(token, instrument_key, refresh_bucket):
+    """Fetch today's 1m candles. refresh_bucket changes during timed app reruns."""
+    encoded_key = quote(instrument_key, safe="")
+    url = f"{UPSTOX_BASE}/v3/historical-candle/intraday/{encoded_key}/minutes/1"
+    response = requests.get(
+        url,
+        headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
+        timeout=20
+    )
+    if response.status_code == 401:
+        raise RuntimeError("Upstox token invalid/expired. नया Analytics Token बनाकर Streamlit Secrets update करो.")
+    response.raise_for_status()
+    return candles_to_frame(response.json().get("data", {}).get("candles", []))
+
 def download_data():
-    data = yf.download("^NSEI", period="5d", interval="1m", progress=False, auto_adjust=False)
-    if data is None or data.empty:
-        return pd.DataFrame()
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-    required = ["Open", "High", "Low", "Close", "Volume"]
-    if not all(c in data.columns for c in required):
-        return pd.DataFrame()
-    data = data[required].copy().dropna(subset=["Open", "High", "Low", "Close"])
-    if data.index.tz is None:
-        data.index = data.index.tz_localize("UTC")
-    data.index = data.index.tz_convert("Asia/Kolkata")
-    return data
+    token = ""
+    try:
+        token = str(st.secrets["UPSTOX_ACCESS_TOKEN"]).strip()
+    except Exception:
+        pass
+
+    if not token:
+        raise RuntimeError(
+            "UPSTOX_ACCESS_TOKEN missing है. Streamlit Cloud → Manage app → Settings → Secrets में token add करो."
+        )
+
+    instrument_key = get_instrument_key()
+    now = datetime.now(IST)
+    from_date = (now.date() - timedelta(days=7)).isoformat()
+    to_date = (now.date() - timedelta(days=1)).isoformat()
+
+    historical = get_previous_sessions(token, instrument_key, from_date, to_date)
+    today = get_today_intraday(
+        token, instrument_key, int(now.timestamp() // 12)
+    )
+
+    combined = pd.concat([historical, today])
+    if combined.empty:
+        return combined
+
+    combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+    return combined[["Open", "High", "Low", "Close", "Volume"]]
+
 
 def make_timeframe(data, minutes):
     result = data.resample(f"{minutes}min", origin="start_day", offset="15min").agg({
@@ -193,7 +287,7 @@ def close_paper_trade(exit_price, reason):
 try:
     raw = download_data()
     if raw.empty:
-        st.error("Yahoo Finance data unavailable.")
+        st.error("Upstox market data unavailable. Token, instrument key या API response जाँचें.")
         st.stop()
 
     df3 = add_indicators(make_timeframe(raw, 3))
@@ -227,6 +321,20 @@ try:
         else:
             reasons.extend(["RSI bearish confirmation received.", "MACD bearish confirmation received."])
 
+    # Feed freshness guard (NSE regular session, IST).
+    latest_data_time = raw.index.max()
+    now_ist = pd.Timestamp.now(tz="Asia/Kolkata")
+    market_open_now = (
+        now_ist.weekday() < 5
+        and (now_ist.hour, now_ist.minute) >= (9, 15)
+        and (now_ist.hour, now_ist.minute) < (15, 30)
+    )
+    feed_age_seconds = (now_ist - latest_data_time).total_seconds()
+    feed_stale = market_open_now and feed_age_seconds > 180
+    if feed_stale:
+        signal = "NO TRADE"
+        reasons.append("Upstox feed is stale (>3 minutes); new signal blocked.")
+
     vwap_data = add_vwap_analysis(df3)
     last_vwap = vwap_data.iloc[-1]
     vwap_available = pd.notna(last_vwap["VWAP"])
@@ -246,6 +354,11 @@ m2.metric("3M RSI", f"{a3['rsi']:.2f}")
 m3.metric("5M RSI", f"{a5['rsi']:.2f}")
 m4.metric("15M RSI", f"{a15['rsi']:.2f}")
 st.caption(f"Last completed 3m candle: {a3['time']}")
+st.caption(f"Latest Upstox 1m candle: {raw.index.max()}")
+if feed_stale:
+    st.error("DATA STALE: Market open है लेकिन latest candle 3 मिनट से पुरानी है. Signal रोक दिया गया है.")
+else:
+    st.success("Upstox data received; candle timestamp checked.")
 
 # ---------------- TIMEFRAME TABLE ----------------
 st.divider()
@@ -398,9 +511,7 @@ st.info(
     "Live option chain connected nahi hai. Actual strike, CE/PE premium, option SL "
     "aur option targets calculate nahi kiye ja sakte. Paper trading filhaal NIFTY "
     "index points par simulate hoti hai."
-)
-
-# ---------------- NIFTY CHART ----------------
+)# ---------------- NIFTY CHART ----------------
 st.divider()
 st.subheader("NIFTY 3-Minute Chart")
 chart = go.Figure()
@@ -432,7 +543,7 @@ s1, s2, s3 = st.columns(3)
 s1.success("3-minute data calculated")
 s2.success("5-minute data calculated")
 s3.success("15-minute data calculated")
-st.caption("Data source: Yahoo Finance. Data may be delayed, incomplete or unavailable.")
+st.caption("Data source: Upstox API V3. Polling-based candles; not tick-by-tick WebSocket data.")
 st.warning(
     "Signals are technical conditions, not guaranteed predictions. Backtest and paper "
     "trade before using real capital. Index point levels are not option premium levels."
