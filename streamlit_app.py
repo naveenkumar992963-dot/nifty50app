@@ -277,8 +277,7 @@ def live_dashboard():
                 "macd_bull":bool(x.MACD>x.MACD_SIGNAL),"macd_bear":bool(x.MACD<x.MACD_SIGNAL),
                 "bull":bull,"bear":bear,"vwap":float(x.VWAP) if pd.notna(x.VWAP) else np.nan,
                 "vol_ratio":float(x.VOL_RATIO) if pd.notna(x.VOL_RATIO) else np.nan,"time":str(d.index[-1])}
-
-    # -------------------- ML RESEARCH --------------------
+       # -------------------- ML RESEARCH --------------------
     def ml_dataset(d):
         x=d[FEATURES].replace([np.inf,-np.inf],np.nan).copy()
         # Predict 3 completed 5-minute bars ahead; ignore tiny moves inside a volatility-scaled dead zone.
@@ -459,7 +458,70 @@ def live_dashboard():
         agreement=sum(weights[k] for k,v in scores.items() if (v>0 and final_score>0) or (v<0 and final_score<0))
         confidence=clamp(abs(final_score)*0.75+agreement*0.25,0,1)*100
         return scores,weights,final_score,confidence
-                # -------------------- FETCH & PROCESS --------------------
+
+    # -------------------- SCALPING PRICE-ACTION SCORE --------------------
+    def price_action_score(frame):
+        """Directional chart score from structure, candle, VWAP, Supertrend and volume."""
+        if frame is None or len(frame) < 25:
+            return 0.0, ["Not enough candles"], 0
+        x, prev = frame.iloc[-1], frame.iloc[-2]
+        score, notes, confirmations = 0.0, [], 0
+        # Trend / market structure proxy
+        if x.EMA9 > x.EMA21 and x.Close > x.EMA21:
+            score += 0.18; confirmations += 1; notes.append("Short-term bullish structure")
+        elif x.EMA9 < x.EMA21 and x.Close < x.EMA21:
+            score -= 0.18; confirmations += 1; notes.append("Short-term bearish structure")
+        # Supertrend
+        if x.ST_DIR > 0:
+            score += 0.14; confirmations += 1; notes.append("Supertrend bullish")
+        elif x.ST_DIR < 0:
+            score -= 0.14; confirmations += 1; notes.append("Supertrend bearish")
+        # VWAP
+        if pd.notna(x.VWAP):
+            if x.Close > x.VWAP:
+                score += 0.12; confirmations += 1; notes.append("Price above VWAP")
+            elif x.Close < x.VWAP:
+                score -= 0.12; confirmations += 1; notes.append("Price below VWAP")
+        # Volume spike
+        vr = x.VOL_RATIO if pd.notna(x.VOL_RATIO) else np.nan
+        if np.isfinite(vr) and vr >= 1.5:
+            if x.Close > x.Open:
+                score += 0.14; confirmations += 1; notes.append(f"Bullish volume spike ({vr:.1f}x)")
+            elif x.Close < x.Open:
+                score -= 0.14; confirmations += 1; notes.append(f"Bearish volume spike ({vr:.1f}x)")
+        # Engulfing / rejection candles
+        body = abs(x.Close-x.Open)
+        rng = max(x.High-x.Low, 1e-9)
+        lower = min(x.Open,x.Close)-x.Low
+        upper = x.High-max(x.Open,x.Close)
+        if x.Close > x.Open and prev.Close < prev.Open and x.Close >= prev.Open and x.Open <= prev.Close:
+            score += 0.12; confirmations += 1; notes.append("Bullish engulfing")
+        elif x.Close < x.Open and prev.Close > prev.Open and x.Open >= prev.Close and x.Close <= prev.Open:
+            score -= 0.12; confirmations += 1; notes.append("Bearish engulfing")
+        elif lower > max(body*1.8, rng*0.45) and upper < rng*0.2:
+            score += 0.08; confirmations += 1; notes.append("Bullish rejection wick")
+        elif upper > max(body*1.8, rng*0.45) and lower < rng*0.2:
+            score -= 0.08; confirmations += 1; notes.append("Bearish rejection wick")
+        # Breakout / fake-breakout check against prior 20 bars (current excluded)
+        prior = frame.iloc[-21:-1]
+        if len(prior) >= 15:
+            rh, rl = prior.High.max(), prior.Low.min()
+            if x.Close > rh:
+                score += 0.20; confirmations += 1; notes.append("Donchian resistance breakout")
+            elif x.High > rh and x.Close <= rh:
+                score -= 0.04; notes.append("Possible failed upside breakout")
+            elif x.Close < rl:
+                score -= 0.20; confirmations += 1; notes.append("Donchian support breakdown")
+            elif x.Low < rl and x.Close >= rl:
+                score += 0.04; notes.append("Possible failed downside breakdown")
+        # Momentum filter: avoid chasing extremes, but don't demand perfect alignment
+        if x.RSI >= 52 and x.MACD > x.MACD_SIGNAL:
+            score += 0.08; confirmations += 1; notes.append("Bullish RSI/MACD momentum")
+        elif x.RSI <= 48 and x.MACD < x.MACD_SIGNAL:
+            score -= 0.08; confirmations += 1; notes.append("Bearish RSI/MACD momentum")
+        return clamp(score), notes, confirmations
+
+    # -------------------- FETCH & PROCESS --------------------
     try:
         now=datetime.now(IST)
         from_date=(now.date()-timedelta(days=25)).isoformat()
@@ -508,22 +570,43 @@ def live_dashboard():
         ml_model,ml_metrics=train_ml(d5)
         strategy_scores,strategy_weights,combined_score,ai_confidence=combined_strategy_scores(
             d3,d5,d15,stats,ml_metrics if ml_model is not None else None)
-        # Scalping decision: NIFTY remains a live reference index; only option-side signals are shown.
-        bull_align = s1["bull"] and s3["bull"] and s5["bull"]
-        bear_align = s1["bear"] and s3["bear"] and s5["bear"]
+        # Flexible multi-factor scalping decision: chart price action is a major input.
+        pa1, pa_notes1, pa_conf1 = price_action_score(d1)
+        pa3, pa_notes3, pa_conf3 = price_action_score(d3)
+        pa5, pa_notes5, pa_conf5 = price_action_score(d5)
+        chart_score = 0.50*pa1 + 0.30*pa3 + 0.20*pa5
+        # Blend chart evidence with the five-strategy ensemble; this is a directional score.
+        final_direction_score = clamp(0.60*chart_score + 0.40*combined_score)
+        bullish_votes = sum(v > 0.08 for v in [pa1, pa3, pa5])
+        bearish_votes = sum(v < -0.08 for v in [pa1, pa3, pa5])
+        total_confirmations = pa_conf1 + pa_conf3 + pa_conf5
+        reasons = []
         if stale:
-            signal="NO TRADE"; reasons=["Market feed stale: scalping signal blocked."]
-        elif bull_align and combined_score>=0.25 and ai_confidence>=52 and s1["rsi"]<78 and s3["adx"]>=15:
-            signal="BUY CE"; reasons=["1m/3m/5m bullish alignment confirmed.","Five-strategy score supports CE bias."]
-        elif bear_align and combined_score<=-0.25 and ai_confidence>=52 and s1["rsi"]>22 and s3["adx"]>=15:
-            signal="BUY PE"; reasons=["1m/3m/5m bearish alignment confirmed.","Five-strategy score supports PE bias."]
+            signal = "NO TRADE"
+            reasons = ["Market feed stale: fresh scalping signals are blocked."]
+        elif final_direction_score >= 0.16 and bullish_votes >= 2 and total_confirmations >= 5 and s1["rsi"] < 82:
+            signal = "BUY CE"
+            reasons = ["Bullish price-action confluence across 1m/3m/5m charts."]
+        elif final_direction_score <= -0.16 and bearish_votes >= 2 and total_confirmations >= 5 and s1["rsi"] > 18:
+            signal = "BUY PE"
+            reasons = ["Bearish price-action confluence across 1m/3m/5m charts."]
         else:
-            signal="NO TRADE"; reasons=[f"Scalping confirmation incomplete: 1m/3m/5m alignment or strategy score not strong enough."]
+            signal = "NO TRADE"
+            reasons = [f"Mixed/weak setup: chart score {final_direction_score:+.2f}; bullish votes {bullish_votes}, bearish votes {bearish_votes}."]
+        # ML is a soft veto only when it strongly contradicts a chart setup.
         if ml_model is not None:
-            if signal=="BUY CE" and ml_metrics["p_up"]<0.48:
-                signal="NO TRADE"; reasons.append("ML estimate conflicts with CE setup.")
-            elif signal=="BUY PE" and ml_metrics["p_up"]>0.52:
-                signal="NO TRADE"; reasons.append("ML estimate conflicts with PE setup.")
+            if signal == "BUY CE" and ml_metrics["p_up"] < 0.38:
+                signal = "NO TRADE"; reasons.append("ML strongly conflicts with CE setup.")
+            elif signal == "BUY PE" and ml_metrics["p_up"] > 0.62:
+                signal = "NO TRADE"; reasons.append("ML strongly conflicts with PE setup.")
+        # Update displayed confidence from confluence, not as a claimed win probability.
+        directional_agreement = max(bullish_votes, bearish_votes) / 3
+        ai_confidence = min(95.0, max(5.0, abs(final_direction_score)*65 + directional_agreement*25 +
+                                      min(total_confirmations, 12)*1.0))
+        strategy_scores["Chart Price Action"] = chart_score
+        strategy_weights["Chart Price Action"] = 0.0  # separately displayed; blended into final score above
+        combined_score = final_direction_score
+        reasons.extend((pa_notes1 + pa_notes3 + pa_notes5)[:8])
     except Exception as e:
         st.error(f"Data / API error: {e}")
         st.info("Secrets में UPSTOX_ACCESS_TOKEN और UPSTOX_INSTRUMENT_KEY = NSE_INDEX|Nifty 50 जाँचें. Option chain API access भी आवश्यक है.")
@@ -596,8 +679,7 @@ def live_dashboard():
                            "PE LTP","PE OI","PE OI Chg","PE Volume","PE IV","PE Delta"]],
                      use_container_width=True,hide_index=True)
         st.caption("OI/PCR are context, not standalone buy/sell signals. API values may be delayed or stale outside market hours.")
-
-    # -------------------- FINAL SIGNAL --------------------
+        # -------------------- FINAL SIGNAL --------------------
     st.divider()
     st.subheader("FINAL SCALPING SIGNAL — OPTIONS ONLY")
     if signal=="BUY CE": st.success("🟢 FINAL SIGNAL: BUY CE")
@@ -607,7 +689,7 @@ def live_dashboard():
     f1.metric("AI confidence score",f"{ai_confidence:.1f}%",help="Heuristic agreement score, not calibrated win probability.")
     f2.metric("Combined strategy score",f"{combined_score:+.3f}",help="Weighted directional score from -1 (bearish) to +1 (bullish).")
     f3.metric("Option selection","CE" if signal=="BUY CE" else "PE" if signal=="BUY PE" else "NONE")
-    st.caption("Only one consolidated result is shown. Individual strategy scores below are diagnostic components.")
+    st.caption("One consolidated signal is shown. Five strategy votes plus chart price-action score are diagnostic components.")
     score_rows=[]
     for name,val in strategy_scores.items():
         score_rows.append({"Strategy":name,"Weight":f"{strategy_weights[name]*100:.0f}%","Directional score":round(val,2),
@@ -649,12 +731,11 @@ def live_dashboard():
         st.warning("Option chain unavailable: CE/PE signal को contract-confirmed नहीं माना जा सकता; entry/SL/targets withheld.")
     else:
         st.info("NO TRADE: कोई option entry, stop loss या target generate नहीं किया गया.")
-
-    # -------------------- CHART ANALYSIS --------------------
+        # -------------------- CHART ANALYSIS --------------------
     st.divider()
     st.subheader("Scalping Chart Analysis — 1m / 3m / 5m")
     def chart_levels(frame):
-        recent=frame.tail(30)
+        recent=frame.iloc[:-1].tail(30) if len(frame) > 1 else frame.tail(30)
         return float(recent.High.max()), float(recent.Low.min())
     for tf_name, frame in [("1 Minute",d1),("3 Minute",d3),("5 Minute",d5)]:
         if len(frame)<10: continue
@@ -677,7 +758,8 @@ def live_dashboard():
         vwap_state="Above VWAP" if pd.notna(last.VWAP) and last.Close>last.VWAP else "Below VWAP" if pd.notna(last.VWAP) else "VWAP unavailable"
         vol_ratio=last.VOL_RATIO if pd.notna(last.VOL_RATIO) else np.nan
         st.write(f"**{tf_name}:** Trend **{trend}** · {vwap_state} · RSI **{last.RSI:.1f}** · ADX **{last.ADX:.1f}** · Candle **{pattern}** · Support **{support:.2f}** · Resistance **{resistance:.2f}** · Volume ratio **{vol_ratio:.2f}x**" if np.isfinite(vol_ratio) else f"**{tf_name}:** Trend **{trend}** · {vwap_state} · RSI **{last.RSI:.1f}** · ADX **{last.ADX:.1f}** · Candle **{pattern}** · Support **{support:.2f}** · Resistance **{resistance:.2f}**")
-   # -------------------- SIGNAL-ONLY MODE --------------------
+
+    # -------------------- SIGNAL-ONLY MODE --------------------
     st.info("Signal-only dashboard: Paper Trading, virtual balance, trade history and automatic broker orders are disabled.")
 
     # -------------------- BACKTEST (SIMPLE, NON-OVERLAPPING SIGNAL STUDY) --------------------
