@@ -1,4 +1,4 @@
-# NIFTY 50 Institutional-Style AI Research & Paper Trading Dashboard
+# NIFTY 50 Live Options Scalping Signal Dashboard — Upstox WebSocket + Chart Analysis
 # Research/education only. No broker order-placement endpoints are used.
 import streamlit as st
 import threading, json
@@ -94,14 +94,11 @@ def live_dashboard():
     BASE = "https://api.upstox.com"
     INDEX_DEFAULT = "NSE_INDEX|Nifty 50"
 
-    st.title("🏛️ NIFTY 50 AI Research & Paper Trading Desk")
-    st.caption("Upstox market data • Multi-timeframe • Option chain/OI • ML research • Walk-forward evaluation • Paper only")
+    st.title("🏛️ NIFTY 50 Live Options Scalping Desk")
+    st.caption("Upstox tick-by-tick NIFTY • 1m/3m/5m chart analysis • CE/PE scalping signals • Signal-only")
 
     # -------------------- SESSION STATE --------------------
-    defaults = {
-        "paper_cash": 100000.0, "paper_trades": [], "open_paper": None,
-        "last_signal_key": None, "signal_log": []
-    }
+    defaults = {"last_signal_key": None, "signal_log": []}
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
@@ -109,21 +106,9 @@ def live_dashboard():
     # -------------------- SETTINGS --------------------
     with st.sidebar:
         st.header("Configuration")
-        risk_pct = st.slider("Virtual risk per trade (%)", 0.25, 2.0, 0.5, 0.25)
-        max_daily_loss = st.number_input("Daily loss stop (₹ virtual)", 500, 20000, 3000, 250)
         expiry_choice = st.selectbox("Option expiry", ["current_week", "next_week", "current_month", "next_month"])
         strike_range = st.slider("Option-chain strikes around ATM", 5, 20, 10)
         ml_threshold = st.slider("Minimum ML probability", 0.50, 0.80, 0.58, 0.01)
-        st.divider()
-        st.subheader("Paper account")
-        st.metric("Virtual balance", f"₹{st.session_state.paper_cash:,.2f}")
-        reset_amount = st.number_input("Reset balance (₹)", min_value=10000, value=100000, step=10000)
-        if st.button("Reset paper account", use_container_width=True):
-            st.session_state.paper_cash = float(reset_amount)
-            st.session_state.paper_trades = []
-            st.session_state.open_paper = None
-            st.session_state.signal_log = []
-            st.rerun()
         if st.button("Refresh market data", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
@@ -215,15 +200,6 @@ def live_dashboard():
 
     # -------------------- INDICATORS --------------------
     def resample_ohlcv(raw, minutes):
-        # Upstox payloads can occasionally arrive with object/string dtypes.
-        # Normalize OHLCV before pandas aggregation (especially Volume.sum).
-        raw = raw.copy()
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            if col in raw.columns:
-                raw[col] = pd.to_numeric(raw[col], errors="coerce")
-        if "Volume" not in raw.columns:
-            raw["Volume"] = 0.0
-        raw["Volume"] = raw["Volume"].fillna(0.0).astype("float64")
         out = raw.resample(f"{minutes}min", origin="start_day", offset="15min").agg(
             {"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna(subset=["Open","High","Low","Close"])
         now = pd.Timestamp.now(tz="Asia/Kolkata")
@@ -233,14 +209,6 @@ def live_dashboard():
 
     def indicators(data):
         d = data.copy()
-        # Ensure numeric dtypes before rolling/ewm/cumsum calculations.
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            if col in d.columns:
-                d[col] = pd.to_numeric(d[col], errors="coerce")
-        if "Volume" not in d.columns:
-            d["Volume"] = 0.0
-        d["Volume"] = d["Volume"].fillna(0.0).astype("float64")
-        d = d.dropna(subset=["Open", "High", "Low", "Close"])
         c,h,l = d.Close,d.High,d.Low
         d["EMA9"] = c.ewm(span=9,adjust=False).mean()
         d["EMA21"] = c.ewm(span=21,adjust=False).mean()
@@ -432,21 +400,6 @@ def live_dashboard():
             payouts.append(call_loss.sum()+put_loss.sum())
         return float(strikes[int(np.argmin(payouts))])
 
-    # -------------------- PAPER TRADING --------------------
-    def save_close(exit_px, reason):
-        t=st.session_state.open_paper
-        if not t: return
-        side=1 if t["side"]=="BUY" else -1
-        pts=(float(exit_px)-t["entry"])*side
-        pnl=pts*t["units"]
-        st.session_state.paper_cash += pnl
-        st.session_state.paper_trades.insert(0,{"Instrument":t["instrument"],"Side":t["side"],
-            "Entry time":t["time"],"Exit time":str(pd.Timestamp.now(tz="Asia/Kolkata")),
-            "Entry":round(t["entry"],2),"Exit":round(float(exit_px),2),"Units":round(t["units"],3),
-            "Points":round(pts,2),"Virtual P&L ₹":round(pnl,2),"Reason":reason})
-        st.session_state.open_paper=None
-
-
     # -------------------- FIVE-STRATEGY ENSEMBLE --------------------
     def clamp(v, lo=-1.0, hi=1.0):
         return float(max(lo, min(hi, v)))
@@ -506,8 +459,7 @@ def live_dashboard():
         agreement=sum(weights[k] for k,v in scores.items() if (v>0 and final_score>0) or (v<0 and final_score<0))
         confidence=clamp(abs(final_score)*0.75+agreement*0.25,0,1)*100
         return scores,weights,final_score,confidence
-
-    # -------------------- FETCH & PROCESS --------------------
+                # -------------------- FETCH & PROCESS --------------------
     try:
         now=datetime.now(IST)
         from_date=(now.date()-timedelta(days=25)).isoformat()
@@ -530,11 +482,13 @@ def live_dashboard():
             quote_data["ltp"]=stream_ltp
             if stream_cp is not None:
                 quote_data["cp"]=stream_cp
+        d1=indicators(raw.copy())
         d3=indicators(resample_ohlcv(raw,3))
         d5=indicators(resample_ohlcv(raw,5))
         d15=indicators(resample_ohlcv(raw,15))
-        if min(len(d3),len(d5),len(d15))<55: st.error("Indicators के लिए पर्याप्त completed candles नहीं हैं."); st.stop()
-        s3,s5,s15=map(tf_summary,[d3,d5,d15])
+        if min(len(d1),len(d3),len(d5))<55: st.error("Scalping indicators के लिए पर्याप्त completed 1m/3m/5m candles नहीं हैं."); st.stop()
+        s1,s3,s5=map(tf_summary,[d1,d3,d5])
+        s15=tf_summary(d15) if len(d15)>=55 else s5
         latest=raw.index.max()
         now_ts=pd.Timestamp.now(tz="Asia/Kolkata")
         market_open=now_ts.weekday()<5 and (now_ts.hour,now_ts.minute)>=(9,15) and (now_ts.hour,now_ts.minute)<(15,30)
@@ -554,33 +508,35 @@ def live_dashboard():
         ml_model,ml_metrics=train_ml(d5)
         strategy_scores,strategy_weights,combined_score,ai_confidence=combined_strategy_scores(
             d3,d5,d15,stats,ml_metrics if ml_model is not None else None)
-        # One consolidated result only. Conservative thresholds reduce low-conviction trades.
+        # Scalping decision: NIFTY remains a live reference index; only option-side signals are shown.
+        bull_align = s1["bull"] and s3["bull"] and s5["bull"]
+        bear_align = s1["bear"] and s3["bear"] and s5["bear"]
         if stale:
-            signal="NO TRADE"; reasons=["Market feed stale: signal blocked."]
-        elif combined_score>=0.30 and ai_confidence>=55:
-            signal="BUY"; reasons=["Five-strategy weighted score supports bullish bias."]
-        elif combined_score<=-0.30 and ai_confidence>=55:
-            signal="SELL"; reasons=["Five-strategy weighted score supports bearish bias."]
+            signal="NO TRADE"; reasons=["Market feed stale: scalping signal blocked."]
+        elif bull_align and combined_score>=0.25 and ai_confidence>=52 and s1["rsi"]<78 and s3["adx"]>=15:
+            signal="BUY CE"; reasons=["1m/3m/5m bullish alignment confirmed.","Five-strategy score supports CE bias."]
+        elif bear_align and combined_score<=-0.25 and ai_confidence>=52 and s1["rsi"]>22 and s3["adx"]>=15:
+            signal="BUY PE"; reasons=["1m/3m/5m bearish alignment confirmed.","Five-strategy score supports PE bias."]
         else:
-            signal="NO TRADE"; reasons=["Strategy agreement/combined score is insufficient."]
-        # ML conflict veto when a model estimate is available.
+            signal="NO TRADE"; reasons=[f"Scalping confirmation incomplete: 1m/3m/5m alignment or strategy score not strong enough."]
         if ml_model is not None:
-            if signal=="BUY" and ml_metrics["p_up"]<0.45:
-                signal="NO TRADE"; reasons.append("ML model conflicts with BUY bias.")
-            elif signal=="SELL" and ml_metrics["p_up"]>0.55:
-                signal="NO TRADE"; reasons.append("ML model conflicts with SELL bias.")
+            if signal=="BUY CE" and ml_metrics["p_up"]<0.48:
+                signal="NO TRADE"; reasons.append("ML estimate conflicts with CE setup.")
+            elif signal=="BUY PE" and ml_metrics["p_up"]>0.52:
+                signal="NO TRADE"; reasons.append("ML estimate conflicts with PE setup.")
     except Exception as e:
         st.error(f"Data / API error: {e}")
         st.info("Secrets में UPSTOX_ACCESS_TOKEN और UPSTOX_INSTRUMENT_KEY = NSE_INDEX|Nifty 50 जाँचें. Option chain API access भी आवश्यक है.")
         st.stop()
-        # -------------------- OVERVIEW --------------------
+
+    # -------------------- OVERVIEW --------------------
     st.divider()
     st.subheader("Market Snapshot")
     c=st.columns(5)
     c[0].metric("NIFTY 50 LTP",f"{spot:,.2f}",None if quote_data.get("cp") is None else f"Prev close {float(quote_data['cp']):,.2f}")
-    c[1].metric("3m RSI",f"{s3['rsi']:.1f}")
-    c[2].metric("5m RSI",f"{s5['rsi']:.1f}")
-    c[3].metric("15m RSI",f"{s15['rsi']:.1f}")
+    c[1].metric("1m RSI",f"{s1['rsi']:.1f}")
+    c[2].metric("3m RSI",f"{s3['rsi']:.1f}")
+    c[3].metric("5m RSI",f"{s5['rsi']:.1f}")
     c[4].metric("3m ADX",f"{s3['adx']:.1f}")
     st.caption(f"Last completed 1m candle: {latest} | Feed age: {age:.0f}s | Option expiry: {chain_all['Expiry'].iloc[0] if not chain_all.empty else expiry_choice}")
     if stream_ltp is not None and stream_connected:
@@ -596,7 +552,7 @@ def live_dashboard():
     # -------------------- MULTI-TIMEFRAME --------------------
     st.subheader("Multi-Timeframe Regime")
     tf_rows=[]
-    for name,s in [("3 min",s3),("5 min",s5),("15 min",s15)]:
+    for name,s in [("1 min",s1),("3 min",s3),("5 min",s5)]:
         tf_rows.append({"Timeframe":name,"Trend":"Bullish" if s["bull"] else "Bearish" if s["bear"] else "Neutral",
                         "Close":round(s["close"],2),"RSI":round(s["rsi"],1),"ADX":round(s["adx"],1),
                         "MACD":"Bullish" if s["macd_bull"] else "Bearish","VWAP":round(s["vwap"],2) if np.isfinite(s["vwap"]) else None})
@@ -643,14 +599,14 @@ def live_dashboard():
 
     # -------------------- FINAL SIGNAL --------------------
     st.divider()
-    st.subheader("FINAL AI SIGNAL — Combined Five-Strategy Result")
-    if signal=="BUY": st.success("🟢 FINAL SIGNAL: BUY")
-    elif signal=="SELL": st.error("🔴 FINAL SIGNAL: SELL")
+    st.subheader("FINAL SCALPING SIGNAL — OPTIONS ONLY")
+    if signal=="BUY CE": st.success("🟢 FINAL SIGNAL: BUY CE")
+    elif signal=="BUY PE": st.error("🔴 FINAL SIGNAL: BUY PE")
     else: st.warning("🟡 FINAL SIGNAL: NO TRADE")
     f1,f2,f3=st.columns(3)
     f1.metric("AI confidence score",f"{ai_confidence:.1f}%",help="Heuristic agreement score, not calibrated win probability.")
     f2.metric("Combined strategy score",f"{combined_score:+.3f}",help="Weighted directional score from -1 (bearish) to +1 (bullish).")
-    f3.metric("Option selection","CE" if signal=="BUY" else "PE" if signal=="SELL" else "NONE")
+    f3.metric("Option selection","CE" if signal=="BUY CE" else "PE" if signal=="BUY PE" else "NONE")
     st.caption("Only one consolidated result is shown. Individual strategy scores below are diagnostic components.")
     score_rows=[]
     for name,val in strategy_scores.items():
@@ -662,151 +618,69 @@ def live_dashboard():
         st.caption(f"ML model estimate: {ml_metrics['p_up']*100:.1f}% Up / {(1-ml_metrics['p_up'])*100:.1f}% Down. Holdout accuracy: {ml_metrics['accuracy']*100:.1f}%.")
 
     # -------------------- OPTION BUYING CANDIDATE --------------------
-    st.subheader("CE / PE Paper-Buy Candidate")
+    st.subheader("Scalping Option Contract")
     candidate=None
-    if not chain.empty and signal in ("BUY","SELL"):
-        side_col="CE" if signal=="BUY" else "PE"
-        key_col=f"{side_col} Key"; ltp_col=f"{side_col} LTP"; vol_col=f"{side_col} Volume"
+    side_name="CE" if signal=="BUY CE" else "PE" if signal=="BUY PE" else None
+    if side_name and not chain.empty:
+        key_col=f"{side_name} Key"; ltp_col=f"{side_name} LTP"; vol_col=f"{side_name} Volume"
         candidates=chain[(chain[ltp_col]>0)&chain[key_col].notna()].copy()
         if not candidates.empty:
             candidates["atm_dist"]=(candidates.Strike-spot).abs()
             candidates=candidates.sort_values(["atm_dist",vol_col],ascending=[True,False])
             candidate=candidates.iloc[0].to_dict()
-            opt_ltp=float(candidate[ltp_col])
-            opt_key=str(candidate[key_col])
-            st.write(f"Directional setup: **BUY {side_col}** | Candidate strike: **{candidate['Strike']:.0f}** | Chain LTP: **₹{opt_ltp:.2f}**")
-            st.caption(f"Instrument key: {opt_key} | IV: {candidate.get(side_col+' IV',0):.2f} | Delta: {candidate.get(side_col+' Delta',0):.3f}")
-            if candidate.get(side_col+" Ask",0)>0 and candidate.get(side_col+" Bid",0)>0:
-                st.caption(f"Bid/Ask: ₹{candidate[side_col+' Bid']:.2f} / ₹{candidate[side_col+' Ask']:.2f}")
+            option_entry=float(candidate[ltp_col])
+            # Short-horizon illustrative premium risk: 20% stop, 1R and 2R targets.
+            option_sl=max(0.05,option_entry*0.80)
+            option_risk=option_entry-option_sl
+            option_t1=option_entry+option_risk
+            option_t2=option_entry+2*option_risk
+            option_rr=(option_t1-option_entry)/option_risk if option_risk>0 else None
+            a,b,c,d,e=st.columns(5)
+            a.metric("Selection",f"BUY {side_name}")
+            b.metric("Strike",f"{candidate['Strike']:.0f}")
+            c.metric("Entry premium",f"₹{option_entry:.2f}")
+            d.metric("Stop Loss",f"₹{option_sl:.2f}")
+            e.metric("T1 / T2",f"₹{option_t1:.2f} / ₹{option_t2:.2f}")
+            st.metric("Risk : Reward",f"1 : {option_rr:.2f}" if option_rr is not None else "N/A")
+            st.caption("Illustrative levels only, derived from option-chain LTP snapshot; not a live executable order. Verify bid/ask spread, liquidity, lot size and slippage.")
         else:
-            st.info("Directional signal मिला, लेकिन usable CE/PE contract data नहीं मिला.")
+            st.warning(f"Signal {side_name} है, लेकिन selected expiry में usable option contract नहीं मिला. Contract unavailable होने पर trade setup confirm नहीं है.")
+    elif side_name:
+        st.warning("Option chain unavailable: CE/PE signal को contract-confirmed नहीं माना जा सकता; entry/SL/targets withheld.")
     else:
-        st.info("Option candidate तभी बनेगा जब NIFTY directional signal और usable option chain दोनों उपलब्ध हों.")
+        st.info("NO TRADE: कोई option entry, stop loss या target generate नहीं किया गया.")
 
-    # Option premium levels are distinct from NIFTY index levels.
-    option_entry=option_sl=option_t1=option_t2=option_rr=None
-    if candidate is not None and signal in ("BUY","SELL"):
-        side_name="CE" if signal=="BUY" else "PE"
-        option_entry=float(candidate[f"{side_name} LTP"])
-        # Conservative premium-risk template; calibrate with historical option backtests before use.
-        option_sl=max(0.05,option_entry*0.70)
-        option_t1=option_entry*1.30
-        option_t2=option_entry*1.60
-        option_risk=option_entry-option_sl
-        option_rr=(option_t1-option_entry)/option_risk if option_risk>0 else None
-        st.subheader("Final Option Trade Plan")
-        p1,p2,p3,p4,p5=st.columns(5)
-        p1.metric("Selection",side_name)
-        p2.metric("Option entry",f"₹{option_entry:.2f}")
-        p3.metric("Option stop loss",f"₹{option_sl:.2f}")
-        p4.metric("Target 1 / 2",f"₹{option_t1:.2f} / ₹{option_t2:.2f}")
-        p5.metric("Risk : Reward",f"1 : {option_rr:.2f}" if option_rr is not None else "N/A")
-        st.caption("Option levels are illustrative premium-based levels from the current chain snapshot; spread, slippage, IV crush and lot size are not modelled.")
-    else:
-        st.subheader("Final Option Trade Plan")
-        st.info("NO TRADE or no valid option contract: CE/PE, premium entry, SL, targets and R:R are withheld.")
-
-
-    # -------------------- LEVELS & RISK --------------------
+    # -------------------- CHART ANALYSIS --------------------
     st.divider()
-    st.subheader("Risk & Index Levels (Research only)")
-    entry=spot
-    atr=max(s3["atr"],s5["atr"]*0.5)
-    risk_pts=max(1.5*atr,1.0)
-    if signal in ("BUY","SELL"):
-        if signal=="BUY": sl=entry-risk_pts; t1=entry+risk_pts; t2=entry+2*risk_pts
-        else: sl=entry+risk_pts; t1=entry-risk_pts; t2=entry-2*risk_pts
-        x1,x2,x3,x4=st.columns(4)
-        x1.metric("Reference entry",f"{entry:,.2f}")
-        x2.metric("ATR stop",f"{sl:,.2f}")
-        x3.metric("Target 1",f"{t1:,.2f}")
-        x4.metric("Target 2",f"{t2:,.2f}")
-        risk_rupees=st.session_state.paper_cash*risk_pct/100
-        units=risk_rupees/risk_pts
-        st.caption(f"Virtual sizing: risk budget ₹{risk_rupees:,.0f} / {risk_pts:.1f} index points = {units:.2f} illustrative units. Not actual NIFTY lot sizing.")
-    else:
-        sl=t1=t2=None
-        st.info("NO TRADE: no entry/SL/target generated.")
+    st.subheader("Scalping Chart Analysis — 1m / 3m / 5m")
+    def chart_levels(frame):
+        recent=frame.tail(30)
+        return float(recent.High.max()), float(recent.Low.min())
+    for tf_name, frame in [("1 Minute",d1),("3 Minute",d3),("5 Minute",d5)]:
+        if len(frame)<10: continue
+        last=frame.iloc[-1]
+        resistance,support=chart_levels(frame)
+        prev=frame.iloc[-2]
+        body=abs(last.Close-last.Open); rng=max(last.High-last.Low,1e-9)
+        lower_wick=min(last.Open,last.Close)-last.Low
+        upper_wick=last.High-max(last.Open,last.Close)
+        pattern="No clear pattern"
+        if last.Close>last.Open and prev.Close<prev.Open and last.Close>=prev.Open and last.Open<=prev.Close:
+            pattern="Bullish Engulfing"
+        elif last.Close<last.Open and prev.Close>prev.Open and last.Open>=prev.Close and last.Close<=prev.Open:
+            pattern="Bearish Engulfing"
+        elif lower_wick>body*2 and upper_wick<body:
+            pattern="Hammer-like candle"
+        elif upper_wick>body*2 and lower_wick<body:
+            pattern="Shooting-star-like candle"
+        trend="Bullish" if last.EMA9>last.EMA21>last.EMA50 else "Bearish" if last.EMA9<last.EMA21<last.EMA50 else "Mixed"
+        vwap_state="Above VWAP" if pd.notna(last.VWAP) and last.Close>last.VWAP else "Below VWAP" if pd.notna(last.VWAP) else "VWAP unavailable"
+        vol_ratio=last.VOL_RATIO if pd.notna(last.VOL_RATIO) else np.nan
+        st.write(f"**{tf_name}:** Trend **{trend}** · {vwap_state} · RSI **{last.RSI:.1f}** · ADX **{last.ADX:.1f}** · Candle **{pattern}** · Support **{support:.2f}** · Resistance **{resistance:.2f}** · Volume ratio **{vol_ratio:.2f}x**" if np.isfinite(vol_ratio) else f"**{tf_name}:** Trend **{trend}** · {vwap_state} · RSI **{last.RSI:.1f}** · ADX **{last.ADX:.1f}** · Candle **{pattern}** · Support **{support:.2f}** · Resistance **{resistance:.2f}**")
+   # -------------------- SIGNAL-ONLY MODE --------------------
+    st.info("Signal-only dashboard: Paper Trading, virtual balance, trade history and automatic broker orders are disabled.")
 
-    # -------------------- PAPER TRADING --------------------
-    st.divider()
-    st.header("🧪 Paper Trading Simulator")
-    st.warning("Paper-only simulation. No broker orders are placed. Index trades use point-based illustrative units; option trades use observed option LTP and virtual units. Fees, slippage and taxes are not included.")
-    daily_loss=sum(float(x["Virtual P&L ₹"]) for x in st.session_state.paper_trades
-                   if str(x["Exit time"])[:10]==str(pd.Timestamp.now(tz="Asia/Kolkata").date()))
-    st.metric("Today's realized virtual P&L",f"₹{daily_loss:+,.2f}")
-    if daily_loss <= -max_daily_loss:
-        st.error("Daily virtual loss limit reached. New paper trades disabled.")
-    trade=st.session_state.open_paper
-    if trade is None:
-        if signal in ("BUY","SELL") and sl is not None:
-            if st.button(f"Open NIFTY {signal} paper position",use_container_width=True,disabled=(daily_loss<=-max_daily_loss)):
-                st.session_state.open_paper={"instrument":"NIFTY 50 INDEX","side":signal,"entry":entry,"sl":sl,
-                    "target":t1,"units":(st.session_state.paper_cash*risk_pct/100)/risk_pts,
-                    "time":str(pd.Timestamp.now(tz="Asia/Kolkata"))}
-                st.rerun()
-        if candidate is not None:
-            optside="BUY"
-            optprice=float(candidate["CE LTP"] if signal=="BUY" else candidate["PE LTP"])
-            optname=f"NIFTY {candidate['Strike']:.0f} {('CE' if signal=='BUY' else 'PE')}"
-            optkey=str(candidate["CE Key"] if signal=="BUY" else candidate["PE Key"])
-            opt_sl=max(0.05,optprice*0.70)
-            opt_target=optprice*1.50
-            if st.button(f"Open {optname} option paper position @ ₹{optprice:.2f}",use_container_width=True,
-                         disabled=(daily_loss<=-max_daily_loss)):
-                opt_risk=max(optprice-opt_sl,0.01)
-                units=(st.session_state.paper_cash*risk_pct/100)/opt_risk
-                st.session_state.open_paper={"instrument":optname,"instrument_key":optkey,"side":"BUY",
-                    "entry":optprice,"sl":opt_sl,"target":opt_target,"units":units,
-                    "time":str(pd.Timestamp.now(tz="Asia/Kolkata"))}
-                st.rerun()
-    else:
-        is_option=bool(trade.get("instrument_key"))
-        current_price=None
-        if is_option:
-            try:
-                oq=fetch_ltp(TOKEN,trade["instrument_key"],int(datetime.now(IST).timestamp()//8))
-                current_price=oq["ltp"]
-            except Exception as e:
-                st.warning(f"Option LTP refresh failed: {e}")
-        else:
-            current_price=spot
-        if current_price is not None:
-            direction=1 if trade["side"]=="BUY" else -1
-            points=(current_price-trade["entry"])*direction
-            unreal=points*trade["units"]
-            q1,q2,q3,q4=st.columns(4)
-            q1.metric("Open position",trade["instrument"])
-            q2.metric("Entry",f"₹{trade['entry']:,.2f}")
-            q3.metric("Current",f"₹{current_price:,.2f}")
-            q4.metric("Unrealized virtual P&L",f"₹{unreal:+,.2f}")
-            st.write(f"Stop: ₹{trade['sl']:,.2f} | Target: ₹{trade['target']:,.2f} | Units: {trade['units']:.3f}")
-            sl_hit=current_price<=trade["sl"] if trade["side"]=="BUY" else current_price>=trade["sl"]
-            tgt_hit=current_price>=trade["target"] if trade["side"]=="BUY" else current_price<=trade["target"]
-            if sl_hit:
-                save_close(current_price,"Paper stop-loss condition"); st.rerun()
-            elif tgt_hit:
-                save_close(current_price,"Paper target condition"); st.rerun()
-            elif st.button("Close paper position at current quote",use_container_width=True):
-                save_close(current_price,"Manual paper exit"); st.rerun()
-        else:
-            st.info("Open position active; waiting for a valid quote. No simulated exit is assumed.")
-
-    st.subheader("Closed Paper Trades")
-    if st.session_state.paper_trades:
-        hist_df=pd.DataFrame(st.session_state.paper_trades)
-        st.dataframe(hist_df,use_container_width=True,hide_index=True)
-        wins=sum(1 for x in st.session_state.paper_trades if x["Virtual P&L ₹"]>0)
-        total=len(st.session_state.paper_trades)
-        gross_profit=sum(x["Virtual P&L ₹"] for x in st.session_state.paper_trades if x["Virtual P&L ₹"]>0)
-        gross_loss=abs(sum(x["Virtual P&L ₹"] for x in st.session_state.paper_trades if x["Virtual P&L ₹"]<0))
-        pf=gross_profit/gross_loss if gross_loss else np.nan
-        a,b,c=st.columns(3)
-        a.metric("Win rate",f"{wins/total*100:.1f}%")
-        b.metric("Profit factor",f"{pf:.2f}" if np.isfinite(pf) else "N/A")
-        c.metric("Closed trades",str(total))
-    else: st.info("No closed paper trades yet.")
-        # -------------------- BACKTEST (SIMPLE, NON-OVERLAPPING SIGNAL STUDY) --------------------
+    # -------------------- BACKTEST (SIMPLE, NON-OVERLAPPING SIGNAL STUDY) --------------------
     st.divider()
     st.subheader("Historical Signal Study (5-minute bars)")
     st.caption("A simple chronological, non-overlapping research simulation using trend filters. Excludes brokerage, slippage and taxes; not a live execution backtest.")
@@ -825,19 +699,22 @@ def live_dashboard():
 
     # -------------------- CHARTS --------------------
     st.divider()
-    st.subheader("NIFTY 3-minute Price & Indicators")
-    fig=go.Figure()
-    fig.add_trace(go.Candlestick(x=d3.index,open=d3.Open,high=d3.High,low=d3.Low,close=d3.Close,name="NIFTY"))
-    for col in ["EMA9","EMA21","EMA50","Supertrend","VWAP"]:
-        if col in d3 and d3[col].notna().any():
-            fig.add_trace(go.Scatter(x=d3.index,y=d3[col],name=col))
-    fig.update_layout(height=560,template="plotly_dark",xaxis_rangeslider_visible=False)
-    st.plotly_chart(fig,use_container_width=True)
-    rfig=go.Figure()
-    rfig.add_trace(go.Scatter(x=d3.index,y=d3.RSI,name="RSI"))
-    rfig.add_hline(y=70,line_dash="dash"); rfig.add_hline(y=30,line_dash="dash"); rfig.add_hline(y=50,line_dash="dot")
-    rfig.update_layout(height=250,template="plotly_dark")
-    st.plotly_chart(rfig,use_container_width=True)
+    st.subheader("NIFTY Scalping Charts — 1m / 3m / 5m")
+    tab1,tab3,tab5=st.tabs(["1 Minute","3 Minute","5 Minute"])
+    for tab,frame in [(tab1,d1),(tab3,d3),(tab5,d5)]:
+        with tab:
+            fig=go.Figure()
+            fig.add_trace(go.Candlestick(x=frame.index,open=frame.Open,high=frame.High,low=frame.Low,close=frame.Close,name="NIFTY"))
+            for col in ["EMA9","EMA21","EMA50","Supertrend","VWAP"]:
+                if col in frame and frame[col].notna().any():
+                    fig.add_trace(go.Scatter(x=frame.index,y=frame[col],name=col))
+            fig.update_layout(height=500,template="plotly_dark",xaxis_rangeslider_visible=False)
+            st.plotly_chart(fig,use_container_width=True)
+            rfig=go.Figure()
+            rfig.add_trace(go.Scatter(x=frame.index,y=frame.RSI,name="RSI"))
+            rfig.add_hline(y=70,line_dash="dash"); rfig.add_hline(y=30,line_dash="dash"); rfig.add_hline(y=50,line_dash="dot")
+            rfig.update_layout(height=220,template="plotly_dark")
+            st.plotly_chart(rfig,use_container_width=True)
 
     # -------------------- STATUS --------------------
     st.divider()
@@ -849,10 +726,9 @@ def live_dashboard():
     st.write(f"- Data source: Upstox REST V3 candles + V3 LTP + V2 option chain")
     st.write(f"- Last candle timestamp: {latest}")
     st.write(f"- Data stale guard: {'TRIGGERED' if stale else 'Not triggered'}")
-    st.write("- Session-state paper history may reset if Streamlit session/server restarts; export or persistent storage is not configured.")
     st.write("- Five strategy ensemble uses heuristic weights; the displayed confidence is not calibrated probability. ML is a recent-data research model, not a production-grade institutional model. News, order book and exchange tick replay are not included.")
-    st.write("- Option chain is a snapshot, not a tick-by-tick feed. Paper option P&L excludes costs, spread impact and lot-size constraints.")
-    st.error("Educational research tool only. No guaranteed prediction. Never treat a model score or paper result as a promise of live returns.")
+    st.write("- Option chain is a snapshot, not a tick-by-tick feed. Option-chain values are snapshots; premium estimates exclude spread impact, slippage and lot-size constraints.")
+    st.error("Educational signal research only. No guaranteed prediction or accuracy. No paper trading and no broker orders are executed.")
 
 
 live_dashboard()
