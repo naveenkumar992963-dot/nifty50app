@@ -209,8 +209,16 @@ def live_dashboard():
 
     def indicators(data):
         d = data.copy()
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-    d[col] = pd.to_numeric(d[col], errors="coerce").astype("float64")
+        def indicators(data):
+    d = data.copy()
+
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        d[col] = pd.to_numeric(d[col], errors="coerce").astype("float64")
+
+    d = d.dropna(subset=["Open", "High", "Low", "Close"])
+    d["Volume"] = d["Volume"].fillna(0.0)
+
+    # इसके नीचे आपका पुराना EMA, RSI, MACD और बाकी indicator code रहेगा
 
 d = d.dropna(subset=["Open", "High", "Low", "Close"])
 d["Volume"] = d["Volume"].fillna(0.0)
