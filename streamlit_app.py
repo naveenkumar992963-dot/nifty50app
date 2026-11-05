@@ -200,11 +200,6 @@ def live_dashboard():
 
     # -------------------- INDICATORS --------------------
     def resample_ohlcv(raw, minutes):
-        raw = raw.copy()
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            if col in raw.columns:
-                raw[col] = pd.to_numeric(raw[col], errors="coerce").astype("float64")
-        raw["Volume"] = raw["Volume"].fillna(0.0)
         out = raw.resample(f"{minutes}min", origin="start_day", offset="15min").agg(
             {"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna(subset=["Open","High","Low","Close"])
         now = pd.Timestamp.now(tz="Asia/Kolkata")
@@ -214,14 +209,6 @@ def live_dashboard():
 
     def indicators(data):
         d = data.copy()
-
-        # Normalize OHLCV types before rolling, VWAP and cumulative calculations.
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            if col in d.columns:
-                d[col] = pd.to_numeric(d[col], errors="coerce").astype("float64")
-        d = d.dropna(subset=["Open", "High", "Low", "Close"])
-        d["Volume"] = d["Volume"].fillna(0.0)
-
         c,h,l = d.Close,d.High,d.Low
         d["EMA9"] = c.ewm(span=9,adjust=False).mean()
         d["EMA21"] = c.ewm(span=21,adjust=False).mean()
@@ -534,7 +521,8 @@ def live_dashboard():
         elif x.RSI <= 48 and x.MACD < x.MACD_SIGNAL:
             score -= 0.08; confirmations += 1; notes.append("Bearish RSI/MACD momentum")
         return clamp(score), notes, confirmations
-        # -------------------- FETCH & PROCESS --------------------
+
+    # -------------------- FETCH & PROCESS --------------------
     try:
         now=datetime.now(IST)
         from_date=(now.date()-timedelta(days=25)).isoformat()
@@ -668,7 +656,8 @@ def live_dashboard():
         st.caption("This is a model score, not a calibrated probability or guarantee. Holdout metrics are historical and can change by regime.")
     else:
         st.warning(f"ML unavailable: {ml_metrics.get('status')} (samples: {ml_metrics.get('samples',0)}). Rule-based filters remain active.")
-            # -------------------- OPTION CHAIN --------------------
+
+    # -------------------- OPTION CHAIN --------------------
     st.divider()
     st.subheader("Live Option Chain & OI Dashboard")
     if chain.empty:
@@ -691,8 +680,7 @@ def live_dashboard():
                            "PE LTP","PE OI","PE OI Chg","PE Volume","PE IV","PE Delta"]],
                      use_container_width=True,hide_index=True)
         st.caption("OI/PCR are context, not standalone buy/sell signals. API values may be delayed or stale outside market hours.")
-
-    # -------------------- FINAL SIGNAL --------------------
+        # -------------------- FINAL SIGNAL --------------------
     st.divider()
     st.subheader("FINAL SCALPING SIGNAL — OPTIONS ONLY")
     if signal=="BUY CE": st.success("🟢 FINAL SIGNAL: BUY CE")
@@ -792,7 +780,8 @@ def live_dashboard():
         st.write(f"Signals: **{len(active)}** | Hit ratio: **{wins/len(active)*100:.1f}%** | Mean return per signal: **{active.strategy_ret.mean()*100:.3f}%**")
         st.caption("Signals can overlap and use close-to-close returns; this is a screening study, not a fully costed portfolio backtest.")
     else: st.info("Historical signal sample अभी पर्याप्त नहीं है.")
-        # -------------------- CHARTS --------------------
+
+    # -------------------- CHARTS --------------------
     st.divider()
     st.subheader("NIFTY Scalping Charts — 1m / 3m / 5m")
     tab1,tab3,tab5=st.tabs(["1 Minute","3 Minute","5 Minute"])
@@ -810,8 +799,7 @@ def live_dashboard():
             rfig.add_hline(y=70,line_dash="dash"); rfig.add_hline(y=30,line_dash="dash"); rfig.add_hline(y=50,line_dash="dot")
             rfig.update_layout(height=220,template="plotly_dark")
             st.plotly_chart(rfig,use_container_width=True)
-
-    # -------------------- STATUS --------------------
+            # -------------------- STATUS --------------------
     st.divider()
     st.subheader("System Health & Limitations")
     h1,h2,h3=st.columns(3)
