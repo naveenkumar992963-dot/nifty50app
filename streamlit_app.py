@@ -206,19 +206,129 @@ def live_dashboard():
         if len(out) and out.index[-1] + pd.Timedelta(minutes=minutes) > now:
             out = out.iloc[:-1]  # completed candles only
         return out
-
+        
     def indicators(data):
         d = data.copy()
-        def indicators(data):
-    d = data.copy()
 
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
-        d[col] = pd.to_numeric(d[col], errors="coerce").astype("float64")
+        # Convert all OHLCV columns to numeric
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            d[col] = pd.to_numeric(
+                d[col], errors="coerce"
+            ).astype("float64")
 
-    d = d.dropna(subset=["Open", "High", "Low", "Close"])
-    d["Volume"] = d["Volume"].fillna(0.0)
+        d = d.dropna(subset=["Open", "High", "Low", "Close"])
+        d["Volume"] = d["Volume"].fillna(0.0)
 
-    # इसके नीचे आपका पुराना EMA, RSI, MACD और बाकी indicator code रहेगा
+        c, h, l = d.Close, d.High, d.Low
+
+        # EMA
+        d["EMA9"] = c.ewm(span=9, adjust=False).mean()
+        d["EMA21"] = c.ewm(span=21, adjust=False).mean()
+        d["EMA50"] = c.ewm(span=50, adjust=False).mean()
+
+        # RSI
+        delta = c.diff()
+        ag = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+        al = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+        d["RSI"] = 100 - 100 / (1 + ag / al.replace(0, np.nan))
+        d["RSI"] = d["RSI"].fillna(50)
+
+        # MACD
+        e12 = c.ewm(span=12, adjust=False).mean()
+        e26 = c.ewm(span=26, adjust=False).mean()
+        d["MACD"] = e12 - e26
+        d["MACD_SIGNAL"] = d.MACD.ewm(span=9, adjust=False).mean()
+        d["MACD_HIST"] = d.MACD - d.MACD_SIGNAL
+
+        # ATR
+        pc = c.shift(1)
+        tr = pd.concat(
+            [h-l, (h-pc).abs(), (l-pc).abs()],
+            axis=1
+        ).max(axis=1)
+        d["ATR"] = tr.ewm(alpha=1/14, adjust=False).mean()
+
+        # ADX / Directional Movement
+        up, down = h.diff(), -l.diff()
+        plus_dm = pd.Series(
+            np.where((up > down) & (up > 0), up, 0.0),
+            index=d.index
+        )
+        minus_dm = pd.Series(
+            np.where((down > up) & (down > 0), down, 0.0),
+            index=d.index
+        )
+
+        atr_safe = d.ATR.replace(0, np.nan)
+        pdi = 100 * plus_dm.ewm(alpha=1/14, adjust=False).mean() / atr_safe
+        mdi = 100 * minus_dm.ewm(alpha=1/14, adjust=False).mean() / atr_safe
+        dx = 100 * (pdi-mdi).abs() / (pdi+mdi).replace(0, np.nan)
+        d["ADX"] = dx.ewm(alpha=1/14, adjust=False).mean().fillna(0)
+
+        # Supertrend
+        mid = (h+l)/2
+        bu = mid + 3*d.ATR
+        bl = mid - 3*d.ATR
+        fu, fl = bu.copy(), bl.copy()
+
+        for i in range(1, len(d)):
+            fu.iloc[i] = (
+                bu.iloc[i]
+                if (bu.iloc[i] < fu.iloc[i-1] or c.iloc[i-1] > fu.iloc[i-1])
+                else fu.iloc[i-1]
+            )
+            fl.iloc[i] = (
+                bl.iloc[i]
+                if (bl.iloc[i] > fl.iloc[i-1] or c.iloc[i-1] < fl.iloc[i-1])
+                else fl.iloc[i-1]
+            )
+
+        direction = np.ones(len(d))
+        stline = np.zeros(len(d))
+
+        for i in range(len(d)):
+            if i == 0:
+                stline[i] = fl.iloc[i]
+            elif direction[i-1] > 0:
+                direction[i], stline[i] = (
+                    (-1, fu.iloc[i]) if c.iloc[i] < fl.iloc[i]
+                    else (1, fl.iloc[i])
+                )
+            else:
+                direction[i], stline[i] = (
+                    (1, fl.iloc[i]) if c.iloc[i] > fu.iloc[i]
+                    else (-1, fu.iloc[i])
+                )
+
+        d["ST_DIR"] = direction
+        d["Supertrend"] = stline
+
+        # Session VWAP - numeric Volume prevents cumsum object error
+        typical = (h+l+c)/3
+        day_key = pd.Series(d.index.date, index=d.index)
+
+        pv = (typical * d["Volume"]).groupby(day_key).cumsum()
+        vv = d["Volume"].groupby(day_key).cumsum()
+
+        d["VWAP"] = pv / vv.replace(0, np.nan)
+
+        # Volume average and returns
+        d["VOL_AVG"] = d["Volume"].rolling(20, min_periods=20).mean()
+        d["RET1"] = c.pct_change()
+        d["RET3"] = c.pct_change(3)
+        d["RET6"] = c.pct_change(6)
+
+        # Model features
+        d["EMA_SPREAD"] = (d.EMA9-d.EMA21)/c
+        d["EMA_TREND"] = (d.EMA21-d.EMA50)/c
+        d["ATR_PCT"] = d.ATR/c
+        d["VWAP_DIST"] = (c-d.VWAP)/c
+        d["VOL_RATIO"] = d.Volume/d.VOL_AVG.replace(0, np.nan)
+
+        return d.replace([np.inf, -np.inf], np.nan)
+        
+
+    
 
 d = d.dropna(subset=["Open", "High", "Low", "Close"])
 d["Volume"] = d["Volume"].fillna(0.0)
