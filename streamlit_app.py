@@ -209,6 +209,11 @@ def live_dashboard():
 
     def indicators(data):
         d = data.copy()
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+    d[col] = pd.to_numeric(d[col], errors="coerce").astype("float64")
+
+d = d.dropna(subset=["Open", "High", "Low", "Close"])
+d["Volume"] = d["Volume"].fillna(0.0)
         c,h,l = d.Close,d.High,d.Low
         d["EMA9"] = c.ewm(span=9,adjust=False).mean()
         d["EMA21"] = c.ewm(span=21,adjust=False).mean()
