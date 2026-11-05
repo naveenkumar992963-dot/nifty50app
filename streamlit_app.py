@@ -522,7 +522,24 @@ def live_dashboard():
             score -= 0.08; confirmations += 1; notes.append("Bearish RSI/MACD momentum")
         return clamp(score), notes, confirmations
 
-    # -------------------- FETCH & PROCESS --------------------
+    def bearish_evidence(frame):
+        """Count independent bearish conditions without requiring every timeframe to be perfectly aligned."""
+        if frame is None or len(frame) < 25:
+            return 0, []
+        x = frame.iloc[-1]
+        prior = frame.iloc[:-1].tail(20)
+        checks = []
+        checks.append(("Close below EMA21", x.Close < x.EMA21))
+        checks.append(("EMA9 below EMA21", x.EMA9 < x.EMA21))
+        checks.append(("EMA21 below EMA50", x.EMA21 < x.EMA50))
+        checks.append(("Price below VWAP", pd.notna(x.VWAP) and x.Close < x.VWAP))
+        checks.append(("Bearish MACD", x.MACD < x.MACD_SIGNAL))
+        checks.append(("RSI below 48", x.RSI < 48))
+        checks.append(("Support breakdown", len(prior) >= 15 and x.Close < prior.Low.min()))
+        checks.append(("Bearish volume expansion", pd.notna(x.VOL_RATIO) and x.VOL_RATIO >= 1.2 and x.Close < x.Open))
+        notes = [name for name, passed in checks if passed]
+        return len(notes), notes
+            # -------------------- FETCH & PROCESS --------------------
     try:
         now=datetime.now(IST)
         from_date=(now.date()-timedelta(days=25)).isoformat()
@@ -581,6 +598,10 @@ def live_dashboard():
         bullish_votes = sum(v > 0.08 for v in [pa1, pa3, pa5])
         bearish_votes = sum(v < -0.08 for v in [pa1, pa3, pa5])
         total_confirmations = pa_conf1 + pa_conf3 + pa_conf5
+        bear_ev1, bear_notes1 = bearish_evidence(d1)
+        bear_ev3, bear_notes3 = bearish_evidence(d3)
+        bear_ev5, bear_notes5 = bearish_evidence(d5)
+        bearish_evidence_total = bear_ev1 + bear_ev3 + bear_ev5
         reasons = []
         if stale:
             signal = "NO TRADE"
@@ -588,18 +609,23 @@ def live_dashboard():
         elif final_direction_score >= 0.16 and bullish_votes >= 2 and total_confirmations >= 5 and s1["rsi"] < 82:
             signal = "BUY CE"
             reasons = ["Bullish price-action confluence across 1m/3m/5m charts."]
-        elif final_direction_score <= -0.16 and bearish_votes >= 2 and total_confirmations >= 5 and s1["rsi"] > 18:
+        # PE path uses bearish confirmations specifically. The previous shared
+        # total_confirmations could be inflated by bullish confirmations.
+        elif (final_direction_score <= -0.12 and bearish_votes >= 2 and
+              bearish_evidence_total >= 10 and s1["rsi"] > 18):
             signal = "BUY PE"
-            reasons = ["Bearish price-action confluence across 1m/3m/5m charts."]
+            reasons = ["Bearish trend/breakdown evidence confirmed across 1m/3m/5m."]
         else:
             signal = "NO TRADE"
-            reasons = [f"Mixed/weak setup: chart score {final_direction_score:+.2f}; bullish votes {bullish_votes}, bearish votes {bearish_votes}."]
+            reasons = [f"Mixed/weak setup: chart score {final_direction_score:+.2f}; bullish votes {bullish_votes}, bearish votes {bearish_votes}; bearish checks {bearish_evidence_total}/24."]
         # ML is a soft veto only when it strongly contradicts a chart setup.
+        # Keep the PE veto stricter so a modest ML disagreement does not hide a
+        # strong, multi-timeframe bearish breakdown.
         if ml_model is not None:
             if signal == "BUY CE" and ml_metrics["p_up"] < 0.38:
                 signal = "NO TRADE"; reasons.append("ML strongly conflicts with CE setup.")
-            elif signal == "BUY PE" and ml_metrics["p_up"] > 0.62:
-                signal = "NO TRADE"; reasons.append("ML strongly conflicts with PE setup.")
+            elif signal == "BUY PE" and ml_metrics["p_up"] > 0.72 and bearish_evidence_total < 15:
+                signal = "NO TRADE"; reasons.append("ML strongly conflicts with PE setup; bearish evidence not strong enough.")
         # Update displayed confidence from confluence, not as a claimed win probability.
         directional_agreement = max(bullish_votes, bearish_votes) / 3
         ai_confidence = min(95.0, max(5.0, abs(final_direction_score)*65 + directional_agreement*25 +
@@ -656,8 +682,7 @@ def live_dashboard():
         st.caption("This is a model score, not a calibrated probability or guarantee. Holdout metrics are historical and can change by regime.")
     else:
         st.warning(f"ML unavailable: {ml_metrics.get('status')} (samples: {ml_metrics.get('samples',0)}). Rule-based filters remain active.")
-
-    # -------------------- OPTION CHAIN --------------------
+        # -------------------- OPTION CHAIN --------------------
     st.divider()
     st.subheader("Live Option Chain & OI Dashboard")
     if chain.empty:
@@ -680,7 +705,8 @@ def live_dashboard():
                            "PE LTP","PE OI","PE OI Chg","PE Volume","PE IV","PE Delta"]],
                      use_container_width=True,hide_index=True)
         st.caption("OI/PCR are context, not standalone buy/sell signals. API values may be delayed or stale outside market hours.")
-        # -------------------- FINAL SIGNAL --------------------
+
+    # -------------------- FINAL SIGNAL --------------------
     st.divider()
     st.subheader("FINAL SCALPING SIGNAL — OPTIONS ONLY")
     if signal=="BUY CE": st.success("🟢 FINAL SIGNAL: BUY CE")
@@ -697,6 +723,11 @@ def live_dashboard():
                            "Contribution":round(val*strategy_weights[name],3)})
     st.dataframe(pd.DataFrame(score_rows),use_container_width=True,hide_index=True)
     for r in reasons: st.write("• "+r)
+    st.caption(f"Bearish confirmation checks: 1m {bear_ev1}/8 · 3m {bear_ev3}/8 · 5m {bear_ev5}/8 · Total {bearish_evidence_total}/24")
+    with st.expander("Bearish/PE signal diagnostics"):
+        st.write("**1m:** " + (", ".join(bear_notes1) if bear_notes1 else "No bearish checks passed"))
+        st.write("**3m:** " + (", ".join(bear_notes3) if bear_notes3 else "No bearish checks passed"))
+        st.write("**5m:** " + (", ".join(bear_notes5) if bear_notes5 else "No bearish checks passed"))
     if ml_model is not None:
         st.caption(f"ML model estimate: {ml_metrics['p_up']*100:.1f}% Up / {(1-ml_metrics['p_up'])*100:.1f}% Down. Holdout accuracy: {ml_metrics['accuracy']*100:.1f}%.")
 
@@ -799,7 +830,8 @@ def live_dashboard():
             rfig.add_hline(y=70,line_dash="dash"); rfig.add_hline(y=30,line_dash="dash"); rfig.add_hline(y=50,line_dash="dot")
             rfig.update_layout(height=220,template="plotly_dark")
             st.plotly_chart(rfig,use_container_width=True)
-            # -------------------- STATUS --------------------
+
+    # -------------------- STATUS --------------------
     st.divider()
     st.subheader("System Health & Limitations")
     h1,h2,h3=st.columns(3)
@@ -815,3 +847,4 @@ def live_dashboard():
 
 
 live_dashboard()
+    
