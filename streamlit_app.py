@@ -200,138 +200,28 @@ def live_dashboard():
 
     # -------------------- INDICATORS --------------------
     def resample_ohlcv(raw, minutes):
+        raw = raw.copy()
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            if col in raw.columns:
+                raw[col] = pd.to_numeric(raw[col], errors="coerce").astype("float64")
+        raw["Volume"] = raw["Volume"].fillna(0.0)
         out = raw.resample(f"{minutes}min", origin="start_day", offset="15min").agg(
             {"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna(subset=["Open","High","Low","Close"])
         now = pd.Timestamp.now(tz="Asia/Kolkata")
         if len(out) and out.index[-1] + pd.Timedelta(minutes=minutes) > now:
             out = out.iloc[:-1]  # completed candles only
         return out
-        
+
     def indicators(data):
         d = data.copy()
 
-        # Convert all OHLCV columns to numeric
+        # Normalize OHLCV types before rolling, VWAP and cumulative calculations.
         for col in ["Open", "High", "Low", "Close", "Volume"]:
-            d[col] = pd.to_numeric(
-                d[col], errors="coerce"
-            ).astype("float64")
-
+            if col in d.columns:
+                d[col] = pd.to_numeric(d[col], errors="coerce").astype("float64")
         d = d.dropna(subset=["Open", "High", "Low", "Close"])
         d["Volume"] = d["Volume"].fillna(0.0)
 
-        c, h, l = d.Close, d.High, d.Low
-
-        # EMA
-        d["EMA9"] = c.ewm(span=9, adjust=False).mean()
-        d["EMA21"] = c.ewm(span=21, adjust=False).mean()
-        d["EMA50"] = c.ewm(span=50, adjust=False).mean()
-
-        # RSI
-        delta = c.diff()
-        ag = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
-        al = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-        d["RSI"] = 100 - 100 / (1 + ag / al.replace(0, np.nan))
-        d["RSI"] = d["RSI"].fillna(50)
-
-        # MACD
-        e12 = c.ewm(span=12, adjust=False).mean()
-        e26 = c.ewm(span=26, adjust=False).mean()
-        d["MACD"] = e12 - e26
-        d["MACD_SIGNAL"] = d.MACD.ewm(span=9, adjust=False).mean()
-        d["MACD_HIST"] = d.MACD - d.MACD_SIGNAL
-
-        # ATR
-        pc = c.shift(1)
-        tr = pd.concat(
-            [h-l, (h-pc).abs(), (l-pc).abs()],
-            axis=1
-        ).max(axis=1)
-        d["ATR"] = tr.ewm(alpha=1/14, adjust=False).mean()
-
-        # ADX / Directional Movement
-        up, down = h.diff(), -l.diff()
-        plus_dm = pd.Series(
-            np.where((up > down) & (up > 0), up, 0.0),
-            index=d.index
-        )
-        minus_dm = pd.Series(
-            np.where((down > up) & (down > 0), down, 0.0),
-            index=d.index
-        )
-
-        atr_safe = d.ATR.replace(0, np.nan)
-        pdi = 100 * plus_dm.ewm(alpha=1/14, adjust=False).mean() / atr_safe
-        mdi = 100 * minus_dm.ewm(alpha=1/14, adjust=False).mean() / atr_safe
-        dx = 100 * (pdi-mdi).abs() / (pdi+mdi).replace(0, np.nan)
-        d["ADX"] = dx.ewm(alpha=1/14, adjust=False).mean().fillna(0)
-
-        # Supertrend
-        mid = (h+l)/2
-        bu = mid + 3*d.ATR
-        bl = mid - 3*d.ATR
-        fu, fl = bu.copy(), bl.copy()
-
-        for i in range(1, len(d)):
-            fu.iloc[i] = (
-                bu.iloc[i]
-                if (bu.iloc[i] < fu.iloc[i-1] or c.iloc[i-1] > fu.iloc[i-1])
-                else fu.iloc[i-1]
-            )
-            fl.iloc[i] = (
-                bl.iloc[i]
-                if (bl.iloc[i] > fl.iloc[i-1] or c.iloc[i-1] < fl.iloc[i-1])
-                else fl.iloc[i-1]
-            )
-
-        direction = np.ones(len(d))
-        stline = np.zeros(len(d))
-
-        for i in range(len(d)):
-            if i == 0:
-                stline[i] = fl.iloc[i]
-            elif direction[i-1] > 0:
-                direction[i], stline[i] = (
-                    (-1, fu.iloc[i]) if c.iloc[i] < fl.iloc[i]
-                    else (1, fl.iloc[i])
-                )
-            else:
-                direction[i], stline[i] = (
-                    (1, fl.iloc[i]) if c.iloc[i] > fu.iloc[i]
-                    else (-1, fu.iloc[i])
-                )
-
-        d["ST_DIR"] = direction
-        d["Supertrend"] = stline
-
-        # Session VWAP - numeric Volume prevents cumsum object error
-        typical = (h+l+c)/3
-        day_key = pd.Series(d.index.date, index=d.index)
-
-        pv = (typical * d["Volume"]).groupby(day_key).cumsum()
-        vv = d["Volume"].groupby(day_key).cumsum()
-
-        d["VWAP"] = pv / vv.replace(0, np.nan)
-
-        # Volume average and returns
-        d["VOL_AVG"] = d["Volume"].rolling(20, min_periods=20).mean()
-        d["RET1"] = c.pct_change()
-        d["RET3"] = c.pct_change(3)
-        d["RET6"] = c.pct_change(6)
-
-        # Model features
-        d["EMA_SPREAD"] = (d.EMA9-d.EMA21)/c
-        d["EMA_TREND"] = (d.EMA21-d.EMA50)/c
-        d["ATR_PCT"] = d.ATR/c
-        d["VWAP_DIST"] = (c-d.VWAP)/c
-        d["VOL_RATIO"] = d.Volume/d.VOL_AVG.replace(0, np.nan)
-
-        return d.replace([np.inf, -np.inf], np.nan)
-        
-
-    
-
-d = d.dropna(subset=["Open", "High", "Low", "Close"])
-d["Volume"] = d["Volume"].fillna(0.0)
         c,h,l = d.Close,d.High,d.Low
         d["EMA9"] = c.ewm(span=9,adjust=False).mean()
         d["EMA21"] = c.ewm(span=21,adjust=False).mean()
@@ -400,7 +290,8 @@ d["Volume"] = d["Volume"].fillna(0.0)
                 "macd_bull":bool(x.MACD>x.MACD_SIGNAL),"macd_bear":bool(x.MACD<x.MACD_SIGNAL),
                 "bull":bull,"bear":bear,"vwap":float(x.VWAP) if pd.notna(x.VWAP) else np.nan,
                 "vol_ratio":float(x.VOL_RATIO) if pd.notna(x.VOL_RATIO) else np.nan,"time":str(d.index[-1])}
-       # -------------------- ML RESEARCH --------------------
+
+    # -------------------- ML RESEARCH --------------------
     def ml_dataset(d):
         x=d[FEATURES].replace([np.inf,-np.inf],np.nan).copy()
         # Predict 3 completed 5-minute bars ahead; ignore tiny moves inside a volatility-scaled dead zone.
@@ -643,8 +534,7 @@ d["Volume"] = d["Volume"].fillna(0.0)
         elif x.RSI <= 48 and x.MACD < x.MACD_SIGNAL:
             score -= 0.08; confirmations += 1; notes.append("Bearish RSI/MACD momentum")
         return clamp(score), notes, confirmations
-
-    # -------------------- FETCH & PROCESS --------------------
+        # -------------------- FETCH & PROCESS --------------------
     try:
         now=datetime.now(IST)
         from_date=(now.date()-timedelta(days=25)).isoformat()
@@ -778,8 +668,7 @@ d["Volume"] = d["Volume"].fillna(0.0)
         st.caption("This is a model score, not a calibrated probability or guarantee. Holdout metrics are historical and can change by regime.")
     else:
         st.warning(f"ML unavailable: {ml_metrics.get('status')} (samples: {ml_metrics.get('samples',0)}). Rule-based filters remain active.")
-
-    # -------------------- OPTION CHAIN --------------------
+            # -------------------- OPTION CHAIN --------------------
     st.divider()
     st.subheader("Live Option Chain & OI Dashboard")
     if chain.empty:
@@ -802,7 +691,8 @@ d["Volume"] = d["Volume"].fillna(0.0)
                            "PE LTP","PE OI","PE OI Chg","PE Volume","PE IV","PE Delta"]],
                      use_container_width=True,hide_index=True)
         st.caption("OI/PCR are context, not standalone buy/sell signals. API values may be delayed or stale outside market hours.")
-        # -------------------- FINAL SIGNAL --------------------
+
+    # -------------------- FINAL SIGNAL --------------------
     st.divider()
     st.subheader("FINAL SCALPING SIGNAL — OPTIONS ONLY")
     if signal=="BUY CE": st.success("🟢 FINAL SIGNAL: BUY CE")
@@ -854,7 +744,8 @@ d["Volume"] = d["Volume"].fillna(0.0)
         st.warning("Option chain unavailable: CE/PE signal को contract-confirmed नहीं माना जा सकता; entry/SL/targets withheld.")
     else:
         st.info("NO TRADE: कोई option entry, stop loss या target generate नहीं किया गया.")
-        # -------------------- CHART ANALYSIS --------------------
+
+    # -------------------- CHART ANALYSIS --------------------
     st.divider()
     st.subheader("Scalping Chart Analysis — 1m / 3m / 5m")
     def chart_levels(frame):
@@ -901,8 +792,7 @@ d["Volume"] = d["Volume"].fillna(0.0)
         st.write(f"Signals: **{len(active)}** | Hit ratio: **{wins/len(active)*100:.1f}%** | Mean return per signal: **{active.strategy_ret.mean()*100:.3f}%**")
         st.caption("Signals can overlap and use close-to-close returns; this is a screening study, not a fully costed portfolio backtest.")
     else: st.info("Historical signal sample अभी पर्याप्त नहीं है.")
-
-    # -------------------- CHARTS --------------------
+        # -------------------- CHARTS --------------------
     st.divider()
     st.subheader("NIFTY Scalping Charts — 1m / 3m / 5m")
     tab1,tab3,tab5=st.tabs(["1 Minute","3 Minute","5 Minute"])
