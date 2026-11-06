@@ -200,6 +200,11 @@ def live_dashboard():
 
     # -------------------- INDICATORS --------------------
     def resample_ohlcv(raw, minutes):
+        # Ensure API/concatenated candle columns are numeric before aggregation.
+        raw = raw.copy()
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            if col in raw.columns:
+                raw[col] = pd.to_numeric(raw[col], errors="coerce")
         out = raw.resample(f"{minutes}min", origin="start_day", offset="15min").agg(
             {"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna(subset=["Open","High","Low","Close"])
         now = pd.Timestamp.now(tz="Asia/Kolkata")
@@ -209,6 +214,14 @@ def live_dashboard():
 
     def indicators(data):
         d = data.copy()
+        # Defensive numeric conversion prevents object-dtype arithmetic in VWAP/cumsum.
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            if col in d.columns:
+                d[col] = pd.to_numeric(d[col], errors="coerce")
+        d = d.dropna(subset=["Open", "High", "Low", "Close"])
+        if "Volume" not in d.columns:
+            d["Volume"] = 0.0
+        d["Volume"] = d["Volume"].fillna(0.0).astype(float)
         c,h,l = d.Close,d.High,d.Low
         d["EMA9"] = c.ewm(span=9,adjust=False).mean()
         d["EMA21"] = c.ewm(span=21,adjust=False).mean()
@@ -356,7 +369,7 @@ def live_dashboard():
         return direction,prob,reasons
 
     # -------------------- OPTION CHAIN NORMALIZER --------------------
-    def normalize_chain(rows):
+    def def normalize_chain(rows):
         out=[]
         for row in rows or []:
             try:
@@ -539,7 +552,7 @@ def live_dashboard():
         checks.append(("Bearish volume expansion", pd.notna(x.VOL_RATIO) and x.VOL_RATIO >= 1.2 and x.Close < x.Open))
         notes = [name for name, passed in checks if passed]
         return len(notes), notes
-            # -------------------- FETCH & PROCESS --------------------
+        # -------------------- FETCH & PROCESS --------------------
     try:
         now=datetime.now(IST)
         from_date=(now.date()-timedelta(days=25)).isoformat()
@@ -638,8 +651,7 @@ def live_dashboard():
         st.error(f"Data / API error: {e}")
         st.info("Secrets में UPSTOX_ACCESS_TOKEN और UPSTOX_INSTRUMENT_KEY = NSE_INDEX|Nifty 50 जाँचें. Option chain API access भी आवश्यक है.")
         st.stop()
-
-    # -------------------- OVERVIEW --------------------
+        # -------------------- OVERVIEW --------------------
     st.divider()
     st.subheader("Market Snapshot")
     c=st.columns(5)
@@ -682,7 +694,8 @@ def live_dashboard():
         st.caption("This is a model score, not a calibrated probability or guarantee. Holdout metrics are historical and can change by regime.")
     else:
         st.warning(f"ML unavailable: {ml_metrics.get('status')} (samples: {ml_metrics.get('samples',0)}). Rule-based filters remain active.")
-        # -------------------- OPTION CHAIN --------------------
+
+    # -------------------- OPTION CHAIN --------------------
     st.divider()
     st.subheader("Live Option Chain & OI Dashboard")
     if chain.empty:
@@ -811,8 +824,7 @@ def live_dashboard():
         st.write(f"Signals: **{len(active)}** | Hit ratio: **{wins/len(active)*100:.1f}%** | Mean return per signal: **{active.strategy_ret.mean()*100:.3f}%**")
         st.caption("Signals can overlap and use close-to-close returns; this is a screening study, not a fully costed portfolio backtest.")
     else: st.info("Historical signal sample अभी पर्याप्त नहीं है.")
-
-    # -------------------- CHARTS --------------------
+        # -------------------- CHARTS --------------------
     st.divider()
     st.subheader("NIFTY Scalping Charts — 1m / 3m / 5m")
     tab1,tab3,tab5=st.tabs(["1 Minute","3 Minute","5 Minute"])
@@ -847,4 +859,3 @@ def live_dashboard():
 
 
 live_dashboard()
-    
