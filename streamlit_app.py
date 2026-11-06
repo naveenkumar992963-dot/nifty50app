@@ -369,7 +369,7 @@ def live_dashboard():
         return direction,prob,reasons
 
     # -------------------- OPTION CHAIN NORMALIZER --------------------
-    def def normalize_chain(rows):
+    def normalize_chain(rows):
         out=[]
         for row in rows or []:
             try:
