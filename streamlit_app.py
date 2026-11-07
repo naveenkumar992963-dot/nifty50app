@@ -200,6 +200,14 @@ def live_dashboard():
 
     # -------------------- INDICATORS --------------------
     def resample_ohlcv(raw, minutes):
+        # Normalize provider payload columns before aggregation; volume can arrive as object/string.
+        raw = raw.copy()
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            if col in raw.columns:
+                raw[col] = pd.to_numeric(raw[col], errors="coerce")
+        if "Volume" not in raw.columns:
+            raw["Volume"] = 0.0
+        raw["Volume"] = raw["Volume"].fillna(0.0).astype("float64")
         out = raw.resample(f"{minutes}min", origin="start_day", offset="15min").agg(
             {"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna(subset=["Open","High","Low","Close"])
         now = pd.Timestamp.now(tz="Asia/Kolkata")
@@ -209,6 +217,14 @@ def live_dashboard():
 
     def indicators(data):
         d = data.copy()
+        # Ensure OHLCV are numeric before rolling, VWAP and cumulative calculations.
+        for col in ["Open", "High", "Low", "Close", "Volume"]:
+            if col in d.columns:
+                d[col] = pd.to_numeric(d[col], errors="coerce")
+        if "Volume" not in d.columns:
+            d["Volume"] = 0.0
+        d["Volume"] = d["Volume"].fillna(0.0).astype("float64")
+        d = d.dropna(subset=["Open", "High", "Low", "Close"])
         c,h,l = d.Close,d.High,d.Low
         d["EMA9"] = c.ewm(span=9,adjust=False).mean()
         d["EMA21"] = c.ewm(span=21,adjust=False).mean()
@@ -249,10 +265,11 @@ def live_dashboard():
                 direction[i],stline[i]=( (1,fl.iloc[i]) if c.iloc[i]>fu.iloc[i] else (-1,fu.iloc[i]) )
         d["ST_DIR"]=direction; d["Supertrend"]=stline
         # Session VWAP (only meaningful if provider supplies volume)
-        typical=(h+l+c)/3
+        typical=((h.astype("float64")+l.astype("float64")+c.astype("float64"))/3.0).astype("float64")
+        volume=d["Volume"].astype("float64").fillna(0.0)
         day_key=pd.Series(d.index.date,index=d.index)
-        pv=(typical*d.Volume.fillna(0)).groupby(day_key).cumsum()
-        vv=d.Volume.fillna(0).groupby(day_key).cumsum()
+        pv=(typical*volume).groupby(day_key).cumsum()
+        vv=volume.groupby(day_key).cumsum()
         d["VWAP"]=pv/vv.replace(0,np.nan)
         d["VOL_AVG"]=d.Volume.rolling(20,min_periods=20).mean()
         d["RET1"]=c.pct_change()
@@ -277,8 +294,7 @@ def live_dashboard():
                 "macd_bull":bool(x.MACD>x.MACD_SIGNAL),"macd_bear":bool(x.MACD<x.MACD_SIGNAL),
                 "bull":bull,"bear":bear,"vwap":float(x.VWAP) if pd.notna(x.VWAP) else np.nan,
                 "vol_ratio":float(x.VOL_RATIO) if pd.notna(x.VOL_RATIO) else np.nan,"time":str(d.index[-1])}
-
-    # -------------------- ML RESEARCH --------------------
+                # -------------------- ML RESEARCH --------------------
     def ml_dataset(d):
         x=d[FEATURES].replace([np.inf,-np.inf],np.nan).copy()
         # Predict 3 completed 5-minute bars ahead; ignore tiny moves inside a volatility-scaled dead zone.
@@ -494,8 +510,7 @@ def live_dashboard():
         agreement = sum(weights[k] for k, v in scores.items() if (v > 0.15 and final_score > 0) or (v < -0.15 and final_score < 0))
         confidence = clamp(abs(final_score) * 0.75 + agreement * 0.25, 0, 1) * 100
         return scores, weights, final_score, confidence
-
-    # -------------------- SCALPING PRICE-ACTION SCORE --------------------
+        # -------------------- SCALPING PRICE-ACTION SCORE --------------------
     def support_resistance(frame):
         """Confirmed swing-pivot zones; right-side confirmation avoids using unconfirmed pivots."""
         empty = {"support": np.nan, "resistance": np.nan, "score": 0.0, "state": "Levels unavailable",
@@ -737,7 +752,7 @@ def live_dashboard():
         st.error(f"Data / API error: {e}")
         st.info("Secrets में UPSTOX_ACCESS_TOKEN और UPSTOX_INSTRUMENT_KEY = NSE_INDEX|Nifty 50 जाँचें. Option chain API access भी आवश्यक है.")
         st.stop()
-        # -------------------- OVERVIEW --------------------
+            # -------------------- OVERVIEW --------------------
     st.divider()
     st.subheader("Market Snapshot")
     c=st.columns(5)
@@ -912,8 +927,7 @@ def live_dashboard():
         st.write(f"Signals: **{len(active)}** | Hit ratio: **{wins/len(active)*100:.1f}%** | Mean return per signal: **{active.strategy_ret.mean()*100:.3f}%**")
         st.caption("Signals can overlap and use close-to-close returns; this is a screening study, not a fully costed portfolio backtest.")
     else: st.info("Historical signal sample अभी पर्याप्त नहीं है.")
-
-    # -------------------- CHARTS --------------------
+        # -------------------- CHARTS --------------------
     st.divider()
     st.subheader("NIFTY Scalping Charts — 1m / 3m / 5m")
     tab1,tab3,tab5=st.tabs(["1 Minute","3 Minute","5 Minute"])
@@ -953,4 +967,3 @@ def live_dashboard():
 
 
 live_dashboard()
-        
