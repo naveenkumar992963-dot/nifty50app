@@ -200,11 +200,6 @@ def live_dashboard():
 
     # -------------------- INDICATORS --------------------
     def resample_ohlcv(raw, minutes):
-        # Ensure API/concatenated candle columns are numeric before aggregation.
-        raw = raw.copy()
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            if col in raw.columns:
-                raw[col] = pd.to_numeric(raw[col], errors="coerce")
         out = raw.resample(f"{minutes}min", origin="start_day", offset="15min").agg(
             {"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna(subset=["Open","High","Low","Close"])
         now = pd.Timestamp.now(tz="Asia/Kolkata")
@@ -214,14 +209,6 @@ def live_dashboard():
 
     def indicators(data):
         d = data.copy()
-        # Defensive numeric conversion prevents object-dtype arithmetic in VWAP/cumsum.
-        for col in ["Open", "High", "Low", "Close", "Volume"]:
-            if col in d.columns:
-                d[col] = pd.to_numeric(d[col], errors="coerce")
-        d = d.dropna(subset=["Open", "High", "Low", "Close"])
-        if "Volume" not in d.columns:
-            d["Volume"] = 0.0
-        d["Volume"] = d["Volume"].fillna(0.0).astype(float)
         c,h,l = d.Close,d.High,d.Low
         d["EMA9"] = c.ewm(span=9,adjust=False).mean()
         d["EMA21"] = c.ewm(span=21,adjust=False).mean()
@@ -308,8 +295,10 @@ def live_dashboard():
             return None, {"status":"Insufficient labelled data","samples":len(X)}
         split=max(int(len(X)*0.80),100)
         if len(X)-split<25: split=len(X)-25
-        Xtr,Xte,ytr,yte=X.iloc[:split],X.iloc[split:],y.iloc[:split],y.iloc[split:]
-        if ytr.nunique()<2 or yte.nunique()<2:
+        # Purge the final 3 training rows: their forward labels overlap the test period.
+        train_end = max(0, split - 3)
+        Xtr,Xte,ytr,yte=X.iloc[:train_end],X.iloc[split:],y.iloc[:train_end],y.iloc[split:]
+        if len(Xtr) < 100 or ytr.nunique()<2 or yte.nunique()<2:
             return None, {"status":"Not enough class diversity in time split","samples":len(X)}
         model=HistGradientBoostingClassifier(max_iter=120,learning_rate=0.06,max_leaf_nodes=15,
                                              l2_regularization=1.0,random_state=42)
@@ -418,62 +407,152 @@ def live_dashboard():
         return float(max(lo, min(hi, v)))
 
     def combined_strategy_scores(d3, d5, d15, chain_stats, ml_metrics):
-        """Five independent strategy votes. Scores are heuristic, not calibrated probabilities."""
-        last5=d5.iloc[-1]; last3=d3.iloc[-1]
-        # 1) Trend-following: multi-timeframe EMA alignment + supertrend
-        trend_votes=[]
-        for d in (d3,d5,d15):
-            x=d.iloc[-1]
-            trend_votes.append(1.0 if x.EMA9>x.EMA21>x.EMA50 and x.ST_DIR>0 else
-                               -1.0 if x.EMA9<x.EMA21<x.EMA50 and x.ST_DIR<0 else 0.0)
-        trend=float(np.mean(trend_votes))
-        # 2) VWAP + volume breakout/acceptance
-        vwap_score=0.0
-        if pd.notna(last5.get("VWAP")) and pd.notna(last5.get("VOL_RATIO")):
-            if last5.Close>last5.VWAP and last5.VOL_RATIO>=1.2: vwap_score=1.0
-            elif last5.Close<last5.VWAP and last5.VOL_RATIO>=1.2: vwap_score=-1.0
-            elif last5.Close>last5.VWAP: vwap_score=0.35
-            elif last5.Close<last5.VWAP: vwap_score=-0.35
-        # 3) Mean reversion: Bollinger z-score + RSI, contrarian direction
-        mean_score=0.0
-        mid=d5.Close.rolling(20).mean().iloc[-1]
-        sd=d5.Close.rolling(20).std().iloc[-1]
-        if pd.notna(mid) and pd.notna(sd) and sd>0:
-            z=(last5.Close-mid)/(2*sd)
-            if z<=-1 and last5.RSI<38: mean_score=1.0
-            elif z>=1 and last5.RSI>62: mean_score=-1.0
-            elif z<=-0.6: mean_score=0.35
-            elif z>=0.6: mean_score=-0.35
-        # 4) Donchian breakout using previous 20 completed bars, current bar excluded
-        prior=d5.iloc[:-1].tail(20)
-        donchian=0.0
-        if len(prior)>=15:
-            if last5.Close>prior.High.max(): donchian=1.0
-            elif last5.Close<prior.Low.min(): donchian=-1.0
-        # 5) Option chain positioning: PCR plus dominant OI walls relative to spot
-        oi_score=0.0
-        if chain_stats and np.isfinite(chain_stats.get("pcr",np.nan)):
-            pcr=chain_stats["pcr"]
-            if pcr>=1.25: oi_score=0.75
-            elif pcr<=0.75: oi_score=-0.75
-            elif pcr>1.05: oi_score=0.35
-            elif pcr<0.95: oi_score=-0.35
-        weights={"Trend Following":0.25,"VWAP + Volume":0.20,"Mean Reversion":0.15,
-                 "Donchian Breakout":0.15,"Options OI + PCR":0.25}
-        scores={"Trend Following":trend,"VWAP + Volume":vwap_score,
-                "Mean Reversion":mean_score,"Donchian Breakout":donchian,
-                "Options OI + PCR":oi_score}
-        weighted=sum(scores[k]*weights[k] for k in scores)
-        ml_adj=0.0
-        if ml_metrics and "p_up" in ml_metrics:
-            ml_adj=clamp((ml_metrics["p_up"]-0.5)*2)*0.10
-        final_score=clamp(weighted+ml_adj)
-        # Confidence is a heuristic agreement score, explicitly not calibrated probability.
-        agreement=sum(weights[k] for k,v in scores.items() if (v>0 and final_score>0) or (v<0 and final_score<0))
-        confidence=clamp(abs(final_score)*0.75+agreement*0.25,0,1)*100
-        return scores,weights,final_score,confidence
+        """Five strategy votes with regime-aware filters; scores are heuristic, not win probabilities."""
+        if min(len(d3), len(d5), len(d15)) < 25:
+            names = ["Trend Following", "VWAP + Volume", "Mean Reversion", "Donchian Breakout", "Options OI + PCR"]
+            weights = dict(zip(names, [0.30, 0.20, 0.10, 0.20, 0.20]))
+            scores = {k: 0.0 for k in names}
+            return scores, weights, 0.0, 0.0
+
+        last5 = d5.iloc[-1]
+        # 1) Trend following: require directional EMA structure and Supertrend on each TF.
+        trend_votes = []
+        for frame in (d3, d5, d15):
+            x = frame.iloc[-1]
+            if x.EMA9 > x.EMA21 > x.EMA50 and x.ST_DIR > 0:
+                trend_votes.append(1.0)
+            elif x.EMA9 < x.EMA21 < x.EMA50 and x.ST_DIR < 0:
+                trend_votes.append(-1.0)
+            else:
+                trend_votes.append(0.0)
+        trend = float(np.mean(trend_votes))
+
+        # 2) VWAP + volume: use completed-bar volume and candle direction; no volume = neutral.
+        vwap_score = 0.0
+        vr = last5.get("VOL_RATIO", np.nan)
+        if pd.notna(last5.get("VWAP")) and np.isfinite(vr):
+            side = 1 if last5.Close > last5.VWAP else -1 if last5.Close < last5.VWAP else 0
+            candle_side = 1 if last5.Close > last5.Open else -1 if last5.Close < last5.Open else 0
+            if side and vr >= 1.35 and candle_side == side:
+                vwap_score = float(side * min(1.0, 0.65 + (vr - 1.35) * 0.25))
+            elif side and vr >= 0.9:
+                vwap_score = 0.25 * side
+
+        # 3) Mean reversion: only active in a weak/ranging regime and with reversal evidence.
+        mean_score = 0.0
+        mid = d5.Close.rolling(20, min_periods=20).mean().iloc[-1]
+        sd = d5.Close.rolling(20, min_periods=20).std().iloc[-1]
+        adx = float(last5.ADX) if pd.notna(last5.ADX) else 0.0
+        if pd.notna(mid) and pd.notna(sd) and sd > 0 and adx < 22:
+            z = (float(last5.Close) - float(mid)) / float(sd)
+            prev5 = d5.iloc[-2]
+            bullish_reversal = last5.Close > last5.Open and last5.Close > prev5.Close
+            bearish_reversal = last5.Close < last5.Open and last5.Close < prev5.Close
+            if z <= -1.6 and last5.RSI < 38 and bullish_reversal:
+                mean_score = 0.75
+            elif z >= 1.6 and last5.RSI > 62 and bearish_reversal:
+                mean_score = -0.75
+            elif z <= -1.25 and last5.RSI < 32:
+                mean_score = 0.35
+            elif z >= 1.25 and last5.RSI > 68:
+                mean_score = -0.35
+
+        # 4) Donchian: breakout must close beyond prior range with ATR buffer and volume.
+        prior = d5.iloc[:-1].tail(20)
+        donchian = 0.0
+        if len(prior) >= 15:
+            rh, rl = float(prior.High.max()), float(prior.Low.min())
+            atr = float(last5.ATR) if pd.notna(last5.ATR) else 0.0
+            buffer = max(atr * 0.05, 0.5)
+            vol_ok = np.isfinite(vr) and vr >= 1.15
+            if last5.Close > rh + buffer and vol_ok and last5.Close > last5.Open:
+                donchian = 1.0
+            elif last5.Close < rl - buffer and vol_ok and last5.Close < last5.Open:
+                donchian = -1.0
+            elif last5.High > rh and last5.Close <= rh:
+                donchian = -0.20  # failed upside break
+            elif last5.Low < rl and last5.Close >= rl:
+                donchian = 0.20   # failed downside break
+
+        # 5) Options positioning: PCR is contextual, not a standalone direction signal.
+        oi_score = 0.0
+        if chain_stats and np.isfinite(chain_stats.get("pcr", np.nan)):
+            pcr = float(chain_stats["pcr"])
+            if 0.0 < pcr < 3.0:
+                oi_score = float(np.clip((pcr - 1.0) / 0.65, -0.65, 0.65))
+
+        weights = {"Trend Following": 0.30, "VWAP + Volume": 0.20, "Mean Reversion": 0.10,
+                   "Donchian Breakout": 0.20, "Options OI + PCR": 0.20}
+        scores = {"Trend Following": trend, "VWAP + Volume": vwap_score,
+                  "Mean Reversion": mean_score, "Donchian Breakout": donchian,
+                  "Options OI + PCR": oi_score}
+        weighted = sum(scores[k] * weights[k] for k in scores)
+        ml_adj = 0.0
+        if ml_metrics and "p_up" in ml_metrics and np.isfinite(ml_metrics["p_up"]):
+            ml_adj = float(np.clip((float(ml_metrics["p_up"]) - 0.5) * 2, -1, 1)) * 0.08
+        final_score = clamp(weighted + ml_adj)
+        agreement = sum(weights[k] for k, v in scores.items() if (v > 0.15 and final_score > 0) or (v < -0.15 and final_score < 0))
+        confidence = clamp(abs(final_score) * 0.75 + agreement * 0.25, 0, 1) * 100
+        return scores, weights, final_score, confidence
 
     # -------------------- SCALPING PRICE-ACTION SCORE --------------------
+    def support_resistance(frame):
+        """Confirmed swing-pivot zones; right-side confirmation avoids using unconfirmed pivots."""
+        empty = {"support": np.nan, "resistance": np.nan, "score": 0.0, "state": "Levels unavailable",
+                 "support_touches": 0, "resistance_touches": 0}
+        if frame is None or len(frame) < 35:
+            return empty
+        data = frame.iloc[:-1].tail(180).copy()  # use completed candles only
+        if len(data) < 25:
+            return empty
+        atrv = data.ATR.iloc[-1] if "ATR" in data else np.nan
+        if not np.isfinite(atrv) or atrv <= 0:
+            atrv = max(float(data.Close.iloc[-1]) * 0.0005, 1.0)
+        tol = max(float(atrv) * 0.22, 2.5)
+        highs, lows = data.High.to_numpy(float), data.Low.to_numpy(float)
+        pivots = []
+        left = right = 3
+        for i in range(left, len(data) - right):
+            if highs[i] >= np.max(highs[i-left:i+right+1]):
+                pivots.append((float(highs[i]), "R"))
+            if lows[i] <= np.min(lows[i-left:i+right+1]):
+                pivots.append((float(lows[i]), "S"))
+        close = float(data.Close.iloc[-1])
+        def cluster(kind, relation):
+            vals = sorted([v for v, k in pivots if k == kind and relation(v)])
+            groups = []
+            for value in vals:
+                if not groups or abs(value - np.mean(groups[-1])) > tol:
+                    groups.append([value])
+                else:
+                    groups[-1].append(value)
+            ranked = []
+            for group in groups:
+                level = float(np.mean(group))
+                touches = sum(abs(float(v) - level) <= tol for v, k in pivots if k == kind)
+                # Favor repeated, recent reactions; require at least one confirmed pivot.
+                ranked.append((level, touches))
+            return ranked
+        supports = cluster("S", lambda v: v < close)
+        resistances = cluster("R", lambda v: v > close)
+        support, st = max(supports, key=lambda z: z[0]) if supports else (np.nan, 0)
+        resistance, rt = min(resistances, key=lambda z: z[0]) if resistances else (np.nan, 0)
+        x = data.iloc[-1]
+        buffer = max(float(atrv) * 0.08, 1.0)
+        vr = x.get("VOL_RATIO", np.nan)
+        vol_ok = pd.notna(vr) and np.isfinite(vr) and float(vr) >= 1.15
+        score, state = 0.0, "Between zones"
+        if np.isfinite(resistance) and close > resistance + buffer and vol_ok and x.Close > x.Open:
+            score, state = 0.30, "Confirmed resistance breakout"
+        elif np.isfinite(support) and close < support - buffer and vol_ok and x.Close < x.Open:
+            score, state = -0.30, "Confirmed support breakdown"
+        elif np.isfinite(resistance) and abs(close - resistance) <= tol and x.Close < x.Open:
+            score, state = -0.18, "Resistance rejection / caution"
+        elif np.isfinite(support) and abs(close - support) <= tol and x.Close > x.Open:
+            score, state = 0.18, "Support rejection / bounce"
+        return {"support": support, "resistance": resistance, "score": score, "state": state,
+                "support_touches": int(st), "resistance_touches": int(rt)}
+
     def price_action_score(frame):
         """Directional chart score from structure, candle, VWAP, Supertrend and volume."""
         if frame is None or len(frame) < 25:
@@ -533,6 +612,11 @@ def live_dashboard():
             score += 0.08; confirmations += 1; notes.append("Bullish RSI/MACD momentum")
         elif x.RSI <= 48 and x.MACD < x.MACD_SIGNAL:
             score -= 0.08; confirmations += 1; notes.append("Bearish RSI/MACD momentum")
+        sr = support_resistance(frame)
+        if sr["score"]:
+            score += sr["score"]
+            confirmations += 1
+            notes.append(f"S/R: {sr['state']}")
         return clamp(score), notes, confirmations
 
     def bearish_evidence(frame):
@@ -552,7 +636,9 @@ def live_dashboard():
         checks.append(("Bearish volume expansion", pd.notna(x.VOL_RATIO) and x.VOL_RATIO >= 1.2 and x.Close < x.Open))
         notes = [name for name, passed in checks if passed]
         return len(notes), notes
-        # -------------------- FETCH & PROCESS --------------------
+
+
+    # -------------------- FETCH & PROCESS --------------------
     try:
         now=datetime.now(IST)
         from_date=(now.date()-timedelta(days=25)).isoformat()
@@ -781,12 +867,12 @@ def live_dashboard():
     st.divider()
     st.subheader("Scalping Chart Analysis — 1m / 3m / 5m")
     def chart_levels(frame):
-        recent=frame.iloc[:-1].tail(30) if len(frame) > 1 else frame.tail(30)
-        return float(recent.High.max()), float(recent.Low.min())
+        levels = support_resistance(frame)
+        return levels["resistance"], levels["support"], levels
     for tf_name, frame in [("1 Minute",d1),("3 Minute",d3),("5 Minute",d5)]:
         if len(frame)<10: continue
         last=frame.iloc[-1]
-        resistance,support=chart_levels(frame)
+        resistance,support,sr_info=chart_levels(frame)
         prev=frame.iloc[-2]
         body=abs(last.Close-last.Open); rng=max(last.High-last.Low,1e-9)
         lower_wick=min(last.Open,last.Close)-last.Low
@@ -803,7 +889,9 @@ def live_dashboard():
         trend="Bullish" if last.EMA9>last.EMA21>last.EMA50 else "Bearish" if last.EMA9<last.EMA21<last.EMA50 else "Mixed"
         vwap_state="Above VWAP" if pd.notna(last.VWAP) and last.Close>last.VWAP else "Below VWAP" if pd.notna(last.VWAP) else "VWAP unavailable"
         vol_ratio=last.VOL_RATIO if pd.notna(last.VOL_RATIO) else np.nan
-        st.write(f"**{tf_name}:** Trend **{trend}** · {vwap_state} · RSI **{last.RSI:.1f}** · ADX **{last.ADX:.1f}** · Candle **{pattern}** · Support **{support:.2f}** · Resistance **{resistance:.2f}** · Volume ratio **{vol_ratio:.2f}x**" if np.isfinite(vol_ratio) else f"**{tf_name}:** Trend **{trend}** · {vwap_state} · RSI **{last.RSI:.1f}** · ADX **{last.ADX:.1f}** · Candle **{pattern}** · Support **{support:.2f}** · Resistance **{resistance:.2f}**")
+        support_txt=f"{support:.2f}" if np.isfinite(support) else "N/A"
+        resistance_txt=f"{resistance:.2f}" if np.isfinite(resistance) else "N/A"
+        st.write(f"**{tf_name}:** Trend **{trend}** · {vwap_state} · RSI **{last.RSI:.1f}** · ADX **{last.ADX:.1f}** · Candle **{pattern}** · Support zone **{support_txt}** · Resistance zone **{resistance_txt}** · {sr_info['state']}" + (f" · Volume ratio **{vol_ratio:.2f}x**" if np.isfinite(vol_ratio) else ""))
 
     # -------------------- SIGNAL-ONLY MODE --------------------
     st.info("Signal-only dashboard: Paper Trading, virtual balance, trade history and automatic broker orders are disabled.")
@@ -824,7 +912,8 @@ def live_dashboard():
         st.write(f"Signals: **{len(active)}** | Hit ratio: **{wins/len(active)*100:.1f}%** | Mean return per signal: **{active.strategy_ret.mean()*100:.3f}%**")
         st.caption("Signals can overlap and use close-to-close returns; this is a screening study, not a fully costed portfolio backtest.")
     else: st.info("Historical signal sample अभी पर्याप्त नहीं है.")
-        # -------------------- CHARTS --------------------
+
+    # -------------------- CHARTS --------------------
     st.divider()
     st.subheader("NIFTY Scalping Charts — 1m / 3m / 5m")
     tab1,tab3,tab5=st.tabs(["1 Minute","3 Minute","5 Minute"])
@@ -835,6 +924,11 @@ def live_dashboard():
             for col in ["EMA9","EMA21","EMA50","Supertrend","VWAP"]:
                 if col in frame and frame[col].notna().any():
                     fig.add_trace(go.Scatter(x=frame.index,y=frame[col],name=col))
+            sr_plot = support_resistance(frame)
+            if np.isfinite(sr_plot["support"]):
+                fig.add_hline(y=sr_plot["support"], line_dash="dot", annotation_text="Support zone")
+            if np.isfinite(sr_plot["resistance"]):
+                fig.add_hline(y=sr_plot["resistance"], line_dash="dot", annotation_text="Resistance zone")
             fig.update_layout(height=500,template="plotly_dark",xaxis_rangeslider_visible=False)
             st.plotly_chart(fig,use_container_width=True)
             rfig=go.Figure()
@@ -859,3 +953,4 @@ def live_dashboard():
 
 
 live_dashboard()
+        
