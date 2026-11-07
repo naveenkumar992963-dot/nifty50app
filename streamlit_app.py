@@ -198,6 +198,16 @@ def live_dashboard():
         r.raise_for_status()
         return r.json().get("data", [])
 
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def fetch_option_contracts(token, key, expiry, bucket):
+        """Fetch official contract metadata, including actual lot size; never assume a fixed lot size."""
+        url = f"{BASE}/v2/option/contract"
+        r = requests.get(url, headers={"Accept":"application/json","Authorization":f"Bearer {token}"},
+                         params={"instrument_key":key,"expiry_date":expiry}, timeout=20)
+        if r.status_code == 401: raise RuntimeError("Option contracts: token invalid/expired.")
+        r.raise_for_status()
+        return r.json().get("data", [])
+
     # -------------------- INDICATORS --------------------
     def resample_ohlcv(raw, minutes):
         # Normalize provider payload columns before aggregation; volume can arrive as object/string.
@@ -294,7 +304,7 @@ def live_dashboard():
                 "macd_bull":bool(x.MACD>x.MACD_SIGNAL),"macd_bear":bool(x.MACD<x.MACD_SIGNAL),
                 "bull":bull,"bear":bear,"vwap":float(x.VWAP) if pd.notna(x.VWAP) else np.nan,
                 "vol_ratio":float(x.VOL_RATIO) if pd.notna(x.VOL_RATIO) else np.nan,"time":str(d.index[-1])}
-                # -------------------- ML RESEARCH --------------------
+                    # -------------------- ML RESEARCH --------------------
     def ml_dataset(d):
         x=d[FEATURES].replace([np.inf,-np.inf],np.nan).copy()
         # Predict 3 completed 5-minute bars ahead; ignore tiny moves inside a volatility-scaled dead zone.
@@ -388,11 +398,15 @@ def live_dashboard():
                     "CE Prev OI":float(cm.get("prev_oi") or 0),"CE Volume":float(cm.get("volume") or 0),
                     "CE Bid":float(cm.get("bid_price") or 0),"CE Ask":float(cm.get("ask_price") or 0),
                     "CE IV":float(cg.get("iv") or 0),"CE Delta":float(cg.get("delta") or 0),
+                    "CE Gamma":float(cg.get("gamma") or 0),"CE Theta":float(cg.get("theta") or 0),
+                    "CE Vega":float(cg.get("vega") or 0),"CE POP":float(cg.get("pop") or 0),
                     "CE Key":c.get("instrument_key"),
                     "PE LTP":float(pm.get("ltp") or 0),"PE OI":float(pm.get("oi") or 0),
                     "PE Prev OI":float(pm.get("prev_oi") or 0),"PE Volume":float(pm.get("volume") or 0),
                     "PE Bid":float(pm.get("bid_price") or 0),"PE Ask":float(pm.get("ask_price") or 0),
                     "PE IV":float(pg.get("iv") or 0),"PE Delta":float(pg.get("delta") or 0),
+                    "PE Gamma":float(pg.get("gamma") or 0),"PE Theta":float(pg.get("theta") or 0),
+                    "PE Vega":float(pg.get("vega") or 0),"PE POP":float(pg.get("pop") or 0),
                     "PE Key":p.get("instrument_key")
                 })
             except (TypeError,ValueError):
@@ -510,7 +524,8 @@ def live_dashboard():
         agreement = sum(weights[k] for k, v in scores.items() if (v > 0.15 and final_score > 0) or (v < -0.15 and final_score < 0))
         confidence = clamp(abs(final_score) * 0.75 + agreement * 0.25, 0, 1) * 100
         return scores, weights, final_score, confidence
-        # -------------------- SCALPING PRICE-ACTION SCORE --------------------
+
+    # -------------------- SCALPING PRICE-ACTION SCORE --------------------
     def support_resistance(frame):
         """Confirmed swing-pivot zones; right-side confirmation avoids using unconfirmed pivots."""
         empty = {"support": np.nan, "resistance": np.nan, "score": 0.0, "state": "Levels unavailable",
@@ -752,7 +767,7 @@ def live_dashboard():
         st.error(f"Data / API error: {e}")
         st.info("Secrets में UPSTOX_ACCESS_TOKEN और UPSTOX_INSTRUMENT_KEY = NSE_INDEX|Nifty 50 जाँचें. Option chain API access भी आवश्यक है.")
         st.stop()
-            # -------------------- OVERVIEW --------------------
+        # -------------------- OVERVIEW --------------------
     st.divider()
     st.subheader("Market Snapshot")
     c=st.columns(5)
@@ -811,12 +826,12 @@ def live_dashboard():
         e,f=st.columns(2)
         e.metric("Highest CE OI strike",f"{stats['max_ce']:,.0f}")
         f.metric("Highest PE OI strike",f"{stats['max_pe']:,.0f}")
-        view_cols=["Strike","CE LTP","CE OI","CE Prev OI","CE Volume","CE IV","CE Delta","PE LTP","PE OI","PE Prev OI","PE Volume","PE IV","PE Delta"]
+        view_cols=["Strike","CE LTP","CE OI","CE Prev OI","CE Volume","CE IV","CE Delta","CE Gamma","CE Theta","CE Vega","PE LTP","PE OI","PE Prev OI","PE Volume","PE IV","PE Delta","PE Gamma","PE Theta","PE Vega"]
         view=chain[view_cols].copy()
         view["CE OI Chg"]=view["CE OI"]-view["CE Prev OI"]
         view["PE OI Chg"]=view["PE OI"]-view["PE Prev OI"]
-        st.dataframe(view[["Strike","CE LTP","CE OI","CE OI Chg","CE Volume","CE IV","CE Delta",
-                           "PE LTP","PE OI","PE OI Chg","PE Volume","PE IV","PE Delta"]],
+        st.dataframe(view[["Strike","CE LTP","CE OI","CE OI Chg","CE Volume","CE IV","CE Delta","CE Gamma","CE Theta","CE Vega",
+                           "PE LTP","PE OI","PE OI Chg","PE Volume","PE IV","PE Delta","PE Gamma","PE Theta","PE Vega"]],
                      use_container_width=True,hide_index=True)
         st.caption("OI/PCR are context, not standalone buy/sell signals. API values may be delayed or stale outside market hours.")
 
@@ -845,40 +860,130 @@ def live_dashboard():
     if ml_model is not None:
         st.caption(f"ML model estimate: {ml_metrics['p_up']*100:.1f}% Up / {(1-ml_metrics['p_up'])*100:.1f}% Down. Holdout accuracy: {ml_metrics['accuracy']*100:.1f}%.")
 
-    # -------------------- OPTION BUYING CANDIDATE --------------------
-    st.subheader("Scalping Option Contract")
+    # -------------------- GREEK-AWARE OPTION SELECTION + RISK MANAGER --------------------
+    st.subheader("Greek-Aware Option Selection & Risk Management Calculator")
+    st.caption("Strike ranking uses Delta, Gamma, Theta, Vega, IV, liquidity and ATM distance. It is a comparative filter, not a profit guarantee.")
+    risk_col1, risk_col2, risk_col3 = st.columns(3)
+    with risk_col1:
+        risk_budget = st.number_input("Maximum acceptable SL loss (₹)", min_value=100.0, max_value=1000000.0, value=1000.0, step=100.0)
+    with risk_col2:
+        capital_limit = st.number_input("Maximum capital available (₹)", min_value=1000.0, max_value=10000000.0, value=20000.0, step=1000.0)
+    with risk_col3:
+        max_lots = st.number_input("Maximum lots allowed", min_value=1, max_value=100, value=2, step=1)
+    sl_pct = st.slider("Stop-loss distance from entry (%)", min_value=5, max_value=40, value=20, step=1)
+
     candidate=None
     side_name="CE" if signal=="BUY CE" else "PE" if signal=="BUY PE" else None
     if side_name and not chain.empty:
         key_col=f"{side_name} Key"; ltp_col=f"{side_name} LTP"; vol_col=f"{side_name} Volume"
+        delta_col=f"{side_name} Delta"; gamma_col=f"{side_name} Gamma"; theta_col=f"{side_name} Theta"
+        vega_col=f"{side_name} Vega"; iv_col=f"{side_name} IV"; bid_col=f"{side_name} Bid"; ask_col=f"{side_name} Ask"
         candidates=chain[(chain[ltp_col]>0)&chain[key_col].notna()].copy()
         if not candidates.empty:
+            # Prefer liquid contracts with useful directional delta; avoid high theta/vega cost for short scalps.
             candidates["atm_dist"]=(candidates.Strike-spot).abs()
-            candidates=candidates.sort_values(["atm_dist",vol_col],ascending=[True,False])
+            candidates["delta_abs"]=candidates[delta_col].abs()
+            candidates["spread_pct"]=np.where((candidates[bid_col]>0)&(candidates[ask_col]>0),
+                                                (candidates[ask_col]-candidates[bid_col]).clip(lower=0)/candidates[ltp_col], 1.0)
+            candidates["theta_cost"]=candidates[theta_col].abs()/candidates[ltp_col].clip(lower=0.05)
+            candidates["vega_cost"]=candidates[vega_col].abs()/candidates[ltp_col].clip(lower=0.05)
+            # Score each factor by rank so different Greek scales do not dominate one another.
+            candidates["delta_score"]=-((candidates["delta_abs"]-0.52).abs())
+            candidates["gamma_score"]=candidates[gamma_col].rank(pct=True).fillna(0)
+            candidates["theta_score"]=-candidates["theta_cost"].rank(pct=True).fillna(1)
+            candidates["vega_score"]=-candidates["vega_cost"].rank(pct=True).fillna(1)
+            candidates["liquidity_score"]=candidates[vol_col].rank(pct=True).fillna(0)
+            candidates["spread_score"]=-candidates["spread_pct"].rank(pct=True).fillna(1)
+            candidates["atm_score"]=-candidates["atm_dist"].rank(pct=True).fillna(1)
+            candidates["greek_selection_score"]=(0.25*candidates["delta_score"].rank(pct=True).fillna(0)+
+                0.15*candidates["gamma_score"]+0.15*candidates["theta_score"].rank(pct=True).fillna(0)+
+                0.10*candidates["vega_score"].rank(pct=True).fillna(0)+0.15*candidates["liquidity_score"]+
+                0.10*candidates["spread_score"].rank(pct=True).fillna(0)+0.10*candidates["atm_score"].rank(pct=True).fillna(0))
+            # Reject contracts with very weak directional sensitivity or unusable quotes when alternatives exist.
+            preferred=candidates[(candidates["delta_abs"].between(0.35,0.75)) &
+                                 (candidates["spread_pct"]<=0.08)]
+            if not preferred.empty:
+                candidates=preferred
+            candidates=candidates.sort_values("greek_selection_score",ascending=False)
             candidate=candidates.iloc[0].to_dict()
-            option_entry=float(candidate[ltp_col])
-            # Short-horizon illustrative premium risk: 20% stop, 1R and 2R targets.
-            option_sl=max(0.05,option_entry*0.80)
-            option_risk=option_entry-option_sl
-            option_t1=option_entry+option_risk
-            option_t2=option_entry+2*option_risk
-            option_rr=(option_t1-option_entry)/option_risk if option_risk>0 else None
+
+            # Entry is estimated at ask when available (more realistic for a buyer), otherwise LTP.
+            option_entry=float(candidate[ask_col]) if float(candidate[ask_col])>0 else float(candidate[ltp_col])
+            option_sl=max(0.05,option_entry*(1.0-sl_pct/100.0))
+            risk_per_unit=option_entry-option_sl
+            option_t1=option_entry+risk_per_unit
+            option_t2=option_entry+2*risk_per_unit
+
+            # Get the official lot size for this exact contract. Do not hard-code NIFTY lot size.
+            lot_size=None
+            lot_source="Unavailable"
+            try:
+                contract_rows=fetch_option_contracts(TOKEN,INDEX_KEY,str(candidate.get("Expiry") or chain_all["Expiry"].iloc[0]),int(now.timestamp()//3600))
+                contract_match=next((x for x in contract_rows if x.get("instrument_key")==candidate[key_col]),None)
+                if contract_match and contract_match.get("lot_size"):
+                    lot_size=int(contract_match["lot_size"]); lot_source="Upstox option-contract API"
+            except Exception as contract_exc:
+                st.warning(f"Official lot size fetch नहीं हुआ: {contract_exc}. नीचे manual lot size भरें.")
+            if not lot_size:
+                lot_size=int(st.number_input("Lot size manually enter करें (Upstox contract से verify करें)",min_value=1,max_value=10000,value=1,step=1))
+                lot_source="Manual user input — verify before trading"
+
+            capital_per_lot=option_entry*lot_size
+            risk_per_lot=risk_per_unit*lot_size
+            lots_by_risk=int(risk_budget//risk_per_lot) if risk_per_lot>0 else 0
+            lots_by_capital=int(capital_limit//capital_per_lot) if capital_per_lot>0 else 0
+            suggested_lots=max(0,min(int(max_lots),lots_by_risk,lots_by_capital))
+            quantity=suggested_lots*lot_size
+            total_capital=capital_per_lot*suggested_lots
+            total_sl_loss=risk_per_lot*suggested_lots
+            t1_profit=risk_per_unit*quantity
+            t2_profit=2*risk_per_unit*quantity
+            spread=float(candidate[ask_col])-float(candidate[bid_col]) if float(candidate[bid_col])>0 and float(candidate[ask_col])>0 else np.nan
+
+            st.markdown("#### 1. Recommended contract")
             a,b,c,d,e=st.columns(5)
             a.metric("Selection",f"BUY {side_name}")
             b.metric("Strike",f"{candidate['Strike']:.0f}")
-            c.metric("Entry premium",f"₹{option_entry:.2f}")
-            d.metric("Stop Loss",f"₹{option_sl:.2f}")
-            e.metric("T1 / T2",f"₹{option_t1:.2f} / ₹{option_t2:.2f}")
-            st.metric("Risk : Reward",f"1 : {option_rr:.2f}" if option_rr is not None else "N/A")
-            st.caption("Illustrative levels only, derived from option-chain LTP snapshot; not a live executable order. Verify bid/ask spread, liquidity, lot size and slippage.")
+            c.metric("Expiry",str(candidate.get("Expiry","N/A")))
+            d.metric("Entry premium",f"₹{option_entry:.2f}")
+            e.metric("Greek rank score",f"{candidate['greek_selection_score']*100:.1f}/100")
+
+            st.markdown("#### 2. Greeks-based strike analysis")
+            g1,g2,g3,g4,g5=st.columns(5)
+            g1.metric("Delta",f"{candidate[delta_col]:.4f}")
+            g2.metric("Gamma",f"{candidate[gamma_col]:.6f}")
+            g3.metric("Theta",f"{candidate[theta_col]:.4f}")
+            g4.metric("Vega",f"{candidate[vega_col]:.4f}")
+            g5.metric("IV",f"{candidate[iv_col]:.2f}")
+            st.caption("Delta = underlying sensitivity; Gamma = delta की तेजी से बदलने की दर; Theta = time decay; Vega = IV change sensitivity. तेज NIFTY move के बावजूद premium कम बढ़ सकता है यदि Delta कम हो, Theta decay/IV गिरावट या spread असर करे. Greek values snapshot हैं, live guarantee नहीं.")
+            st.write(f"Liquidity: volume {candidate[vol_col]:,.0f} · Bid ₹{candidate[bid_col]:.2f} · Ask ₹{candidate[ask_col]:.2f} · Spread {f'{spread:.2f}' if np.isfinite(spread) else 'N/A'} · Lot size {lot_size} ({lot_source})")
+
+            st.markdown("#### 3. Stop loss, targets and position size")
+            p1,p2,p3,p4,p5=st.columns(5)
+            p1.metric("Stop Loss",f"₹{option_sl:.2f}")
+            p2.metric("Target 1",f"₹{option_t1:.2f}")
+            p3.metric("Target 2",f"₹{option_t2:.2f}")
+            p4.metric("Lots suggested",str(suggested_lots))
+            p5.metric("Total quantity",f"{quantity:,}")
+            q1,q2,q3=st.columns(3)
+            q1.metric("Estimated capital",f"₹{total_capital:,.2f}")
+            q2.metric("Total SL loss",f"₹{total_sl_loss:,.2f}")
+            q3.metric("Risk : Reward", "1 : 1 / 1 : 2")
+            q4,q5=st.columns(2)
+            q4.metric("Potential profit at T1",f"₹{t1_profit:,.2f}")
+            q5.metric("Potential profit at T2",f"₹{t2_profit:,.2f}")
+            if suggested_lots==0:
+                st.error("आपके risk budget या capital limit में 1 lot भी fit नहीं हो रहा. Trade size घटाएँ या trade skip करें; budget बढ़ाने के लिए दबाव न लें.")
+            else:
+                st.success(f"Calculator के अनुसार {suggested_lots} lot ({quantity} quantity) risk budget और capital limit के अंदर है.")
+            st.caption("Calculations approximate हैं: entry ask/LTP snapshot और premium SL पर आधारित. Brokerage, taxes, slippage, gap risk और actual fill अलग हो सकते हैं. Greeks और option prices तेजी से बदलते हैं. यह order place नहीं करता.")
         else:
-            st.warning(f"Signal {side_name} है, लेकिन selected expiry में usable option contract नहीं मिला. Contract unavailable होने पर trade setup confirm नहीं है.")
+            st.warning(f"Signal {side_name} है, लेकिन selected expiry में usable option contract नहीं मिला.")
     elif side_name:
         st.warning("Option chain unavailable: CE/PE signal को contract-confirmed नहीं माना जा सकता; entry/SL/targets withheld.")
     else:
         st.info("NO TRADE: कोई option entry, stop loss या target generate नहीं किया गया.")
-
-    # -------------------- CHART ANALYSIS --------------------
+                                                # -------------------- CHART ANALYSIS --------------------
     st.divider()
     st.subheader("Scalping Chart Analysis — 1m / 3m / 5m")
     def chart_levels(frame):
@@ -927,7 +1032,8 @@ def live_dashboard():
         st.write(f"Signals: **{len(active)}** | Hit ratio: **{wins/len(active)*100:.1f}%** | Mean return per signal: **{active.strategy_ret.mean()*100:.3f}%**")
         st.caption("Signals can overlap and use close-to-close returns; this is a screening study, not a fully costed portfolio backtest.")
     else: st.info("Historical signal sample अभी पर्याप्त नहीं है.")
-        # -------------------- CHARTS --------------------
+
+    # -------------------- CHARTS --------------------
     st.divider()
     st.subheader("NIFTY Scalping Charts — 1m / 3m / 5m")
     tab1,tab3,tab5=st.tabs(["1 Minute","3 Minute","5 Minute"])
@@ -962,7 +1068,7 @@ def live_dashboard():
     st.write(f"- Last candle timestamp: {latest}")
     st.write(f"- Data stale guard: {'TRIGGERED' if stale else 'Not triggered'}")
     st.write("- Five strategy ensemble uses heuristic weights; the displayed confidence is not calibrated probability. ML is a recent-data research model, not a production-grade institutional model. News, order book and exchange tick replay are not included.")
-    st.write("- Option chain is a snapshot, not a tick-by-tick feed. Option-chain values are snapshots; premium estimates exclude spread impact, slippage and lot-size constraints.")
+    st.write("- Option chain is a snapshot, not a tick-by-tick feed. Option-chain values and Greeks are snapshots; premium estimates exclude brokerage, taxes, slippage and gap risk. Position sizing uses official contract lot size when available.")
     st.error("Educational signal research only. No guaranteed prediction or accuracy. No paper trading and no broker orders are executed.")
 
 
