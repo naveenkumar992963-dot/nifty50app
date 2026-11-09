@@ -1,7 +1,7 @@
-streamlit
-upstox-python-sdk
-pandas
+streamlit>=1.37.0
 numpy
+pandas
 requests
 plotly
 scikit-learn
+upstox-python-sdk
