@@ -1,26 +1,7 @@
-Fix the Streamlit deployment dependency installation error completely.
-
-The current deployment shows:
-"installer returned a non-zero exit code"
-"Error during processing dependencies"
-
-Requirements:
-
-1. Inspect and fix all dependency conflicts.
-2. Create a clean and compatible requirements.txt.
-3. Use stable, mutually compatible versions of Python packages.
-4. Ensure compatibility with the current Streamlit Cloud Python environment.
-5. Check Streamlit, pandas, numpy, yfinance, requests, websocket-client, plotly, scipy, scikit-learn, and Upstox SDK dependencies.
-6. Avoid unnecessary package installations and conflicting version constraints.
-7. Do not downgrade or upgrade packages unnecessarily.
-8. Verify that all imported libraries are included in requirements.txt.
-9. Fix installation errors involving Pygments, mdurl, markdown-it-py, and rich if applicable.
-10. Check Python version compatibility.
-11. Preserve all existing NIFTY 50 PRO MAX features.
-12. Preserve Upstox API authentication and live WebSocket functionality.
-13. Preserve option chain, Greeks, OI, IV, EMA, VWAP, RSI, MACD, ADX, Supertrend and ML prediction features.
-14. Do not remove any working functionality to fix deployment.
-15. Fix all startup errors and verify the application can launch successfully.
-
-IMPORTANT:
-Do not randomly change package versions. Identify the actual dependency conflict from the deployment logs and fix its root cause. Provide the complete corrected requirements.txt and updated application code if necessary.
+streamlit
+upstox-python-sdk
+pandas
+numpy
+requests
+plotly
+scikit-learn
