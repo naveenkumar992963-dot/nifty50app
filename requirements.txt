@@ -1,7 +1,28 @@
-streamlit
-upstox-python-sdk
-pandas
-numpy
-requests
-plotly
-scikit-learn
+Upgrade NIFTY 50 PRO MAX to an advanced, highly accurate NIFTY 50 options scalping analysis system.
+
+Requirements:
+
+1. Use Upstox API and WebSocket for reliable real-time NIFTY 50 market data.
+2. Analyze 1-minute, 3-minute and 5-minute charts.
+3. Include EMA 9/21/50/200, VWAP, RSI, MACD, ADX, Supertrend, ATR, Volume and Fibonacci levels.
+4. Analyze live option chain, ATM strikes, OI, Change in OI, PCR, IV, Delta, Theta, Gamma and Vega.
+5. Generate only BUY CE, BUY PE and NO TRADE signals.
+6. Support both MODERATE and STRONG signals.
+7. Use multi-timeframe trend confirmation before generating signals.
+8. Add support, resistance, breakout, breakdown and candlestick pattern detection.
+9. Add ML-based 5-minute and 15-minute prediction with realistic probability calibration.
+10. Add Greeks + IV + OI + liquidity-based best option selector.
+11. Provide Entry Price, Stop Loss, Target 1, Target 2 and Target 3.
+12. Trading capital: ₹10,000.
+13. Maximum risk per trade: 2% (₹200).
+14. Manual execution only. Never place automatic orders.
+15. Filter illiquid options and excessive bid-ask spreads.
+16. Avoid false signals and conflicting multi-timeframe confirmations.
+17. Show clear reasons behind every signal.
+18. Display live data timestamps and API connection status.
+19. Add proper error handling, data validation and automatic WebSocket reconnection.
+20. Never generate BUY signals using stale or missing market data.
+21. Preserve all existing working features and fix bugs without breaking the application.
+22. Backtest and evaluate signal performance using chronological out-of-sample data.
+
+Priority: Capital protection, reliable live data, signal quality and risk management over signal frequency.
