@@ -1,7 +1,7 @@
-streamlit>=1.37.0
-numpy
-pandas
-requests
-plotly
-scikit-learn
-upstox-python-sdk
+streamlit>=1.38
+pandas>=2.1
+numpy>=1.26
+requests>=2.31
+plotly>=5.20
+upstox-python-sdk>=2.19
+scikit-learn>=1.4
