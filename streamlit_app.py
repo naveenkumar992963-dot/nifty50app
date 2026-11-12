@@ -239,13 +239,29 @@ def apply_option_ticks(chain, stream_state):
     field_map = {"ltp":"LTP", "bid":"Bid", "ask":"Ask", "bid_qty":"Bid Qty",
                  "ask_qty":"Ask Qty", "oi":"OI", "prev_oi":"Prev OI", "volume":"Volume",
                  "iv":"IV", "delta":"Delta", "gamma":"Gamma", "theta":"Theta", "vega":"Vega"}
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
     for side in ("CE", "PE"):
         key_col = f"{side} Key"
         if key_col not in out.columns:
             continue
+        age_col = f"{side} Tick Age (s)"
+        fresh_col = f"{side} Tick Fresh"
+        out[age_col] = np.nan
+        out[fresh_col] = False
         for idx, instrument_key in out[key_col].items():
             tick = ticks.get(instrument_key)
             if not tick:
+                continue
+            try:
+                updated = datetime.fromisoformat(str(tick.get("updated_at")))
+                age = max(0.0, (now - updated).total_seconds())
+            except Exception:
+                age = float("inf")
+            out.at[idx, age_col] = age
+            is_fresh = age <= 10.0
+            out.at[idx, fresh_col] = is_fresh
+            # Never let an old websocket quote overwrite a newer REST snapshot.
+            if not is_fresh:
                 continue
             for source, suffix in field_map.items():
                 col = f"{side} {suffix}"
@@ -260,8 +276,8 @@ def live_dashboard():
     BASE = "https://api.upstox.com"
     INDEX_DEFAULT = "NSE_INDEX|Nifty 50"
 
-    st.title("🏛️ NIFTY 50 Live Options Scalping Desk")
-    st.caption("Upstox tick-by-tick NIFTY • 1m/3m/5m chart analysis • CE/PE scalping signals • Signal-only")
+    st.title("🏛️ NIFTY 50 PRO MAX — Five Strategy AI Desk")
+    st.caption("Upstox V3 • five-strategy ensemble • completed 1m/3m/5m/15m analysis • manual CE/PE signals only")
 
     # -------------------- SESSION STATE --------------------
     defaults = {"last_signal_key": None, "signal_log": []}
@@ -275,6 +291,17 @@ def live_dashboard():
         expiry_choice = st.selectbox("Option expiry", ["current_week", "next_week", "current_month", "next_month"])
         strike_range = st.slider("Option-chain strikes around ATM", 5, 20, 10)
         ml_threshold = st.slider("Minimum ML probability", 0.50, 0.80, 0.58, 0.01)
+        st.subheader("Risk Planning (manual trades only)")
+        capital = st.number_input("Trading capital (₹)", min_value=1000, max_value=10000000, value=10000, step=1000)
+        risk_pct = st.number_input("Maximum planned risk per trade (%)", min_value=0.25, max_value=3.0, value=1.0, step=0.25)
+        max_daily_loss_pct = st.number_input("Daily loss stop (%)", min_value=0.5, max_value=10.0, value=2.0, step=0.5)
+        max_spread_pct = st.slider("Maximum option bid/ask spread (%)", 0.5, 5.0, 2.0, 0.25)
+        min_option_volume = st.number_input("Minimum option volume (contracts)", min_value=0, max_value=10000000, value=500, step=500)
+        min_option_oi = st.number_input("Minimum option OI", min_value=0, max_value=100000000, value=5000, step=1000)
+        premium_sl_pct = st.slider("Illustrative premium stop (%)", 5.0, 30.0, 12.0, 1.0)
+        min_delta = st.slider("Minimum absolute Delta", 0.20, 0.60, 0.30, 0.05)
+        max_delta = st.slider("Maximum absolute Delta", 0.40, 0.90, 0.70, 0.05)
+        st.caption("ये planning limits हैं. App broker orders place नहीं करती.")
         if st.button("Refresh market data", use_container_width=True):
             st.cache_data.clear()
             st.rerun()
@@ -363,8 +390,7 @@ def live_dashboard():
         if r.status_code == 401: raise RuntimeError("Option chain: token invalid/expired.")
         r.raise_for_status()
         return r.json().get("data", [])
-
-    # -------------------- INDICATORS --------------------
+                    # -------------------- INDICATORS --------------------
     def resample_ohlcv(raw, minutes):
         # Force OHLCV to numeric before resampling; Upstox/cache data can contain object dtype.
         raw = raw.copy()
@@ -458,8 +484,7 @@ def live_dashboard():
                 "macd_bull":bool(x.MACD>x.MACD_SIGNAL),"macd_bear":bool(x.MACD<x.MACD_SIGNAL),
                 "bull":bull,"bear":bear,"vwap":float(x.VWAP) if pd.notna(x.VWAP) else np.nan,
                 "vol_ratio":float(x.VOL_RATIO) if pd.notna(x.VOL_RATIO) else np.nan,"time":str(d.index[-1])}
-
-    # -------------------- ML RESEARCH --------------------
+        # -------------------- ML RESEARCH --------------------
     def ml_dataset(d):
         x=d[FEATURES].replace([np.inf,-np.inf],np.nan).copy()
         # Predict 3 completed 5-minute bars ahead; ignore tiny moves inside a volatility-scaled dead zone.
@@ -495,96 +520,6 @@ def live_dashboard():
         p=float(final.predict_proba(last[FEATURES])[0][1])
         metrics["p_up"]=p
         return final,metrics
-
-
-    # -------------------- USER REQUESTED TWO STRATEGIES --------------------
-    def _two_strategy_scores(one, five, fifteen):
-        """
-        Directional setup-strength scores, not calibrated win probabilities.
-        Returns scores in [-1,+1] for Breakout-Retest and Fibonacci separately.
-        """
-        notes = []
-        if any(x is None or len(x) < 25 for x in (one, five, fifteen)):
-            return 0.0, 0.0, ["Insufficient 1m/5m/15m candles: strategy scores unavailable."]
-
-        a, b, c = one.iloc[-1], five.iloc[-1], fifteen.iloc[-1]
-        prev = one.iloc[-2]
-        br = 0.0
-
-        # Trend Following + Breakout Retest
-        bull_htf = bool(b.EMA9 > b.EMA21 > b.EMA50 and c.EMA9 > c.EMA21)
-        bear_htf = bool(b.EMA9 < b.EMA21 < b.EMA50 and c.EMA9 < c.EMA21)
-        if bull_htf:
-            br += 0.25
-            notes.append("Breakout-Retest: 5m/15m bullish trend aligned")
-        elif bear_htf:
-            br -= 0.25
-            notes.append("Breakout-Retest: 5m/15m bearish trend aligned")
-
-        window = one.iloc[-22:-2]
-        if len(window) >= 15:
-            resistance = float(window.High.max())
-            support = float(window.Low.min())
-            atr = float(a.ATR) if pd.notna(a.ATR) and float(a.ATR) > 0 else max(float(a.Close)*0.001, 1.0)
-            recent = one.iloc[-7:-2]
-            bull_break = bool((recent.Close > resistance).any())
-            bear_break = bool((recent.Close < support).any())
-            bull_retest = bull_break and float(a.Low) <= resistance + 0.25*atr and float(a.Close) > resistance
-            bear_retest = bear_break and float(a.High) >= support - 0.25*atr and float(a.Close) < support
-            if bull_retest:
-                br += 0.35
-                notes.append("Breakout-Retest: bullish breakout level retested and held")
-            elif bull_break:
-                br += 0.12
-                notes.append("Breakout-Retest: bullish breakout, retest not confirmed")
-            if bear_retest:
-                br -= 0.35
-                notes.append("Breakout-Retest: bearish breakdown level retested and held")
-            elif bear_break:
-                br -= 0.12
-                notes.append("Breakout-Retest: bearish breakdown, retest not confirmed")
-
-        if float(a.Close) > float(a.Open) and float(a.Close) > float(prev.High):
-            br += 0.20
-            notes.append("Breakout-Retest: bullish confirmation candle")
-        elif float(a.Close) < float(a.Open) and float(a.Close) < float(prev.Low):
-            br -= 0.20
-            notes.append("Breakout-Retest: bearish confirmation candle")
-        vol_ratio = a.get("VOL_RATIO", np.nan)
-        if pd.notna(vol_ratio) and float(vol_ratio) >= 1.20:
-            br += 0.10 if br > 0 else (-0.10 if br < 0 else 0.0)
-            notes.append("Breakout-Retest: relative volume confirmation")
-        br = float(np.clip(br, -1.0, 1.0))
-
-        # Fibonacci retracement: last 50 completed 5m bars; direction from swing order.
-        fib = 0.0
-        swings = five.iloc[-51:-1].copy()
-        if len(swings) >= 25:
-            hi_idx, lo_idx = swings.High.idxmax(), swings.Low.idxmin()
-            hi, lo = float(swings.loc[hi_idx, "High"]), float(swings.loc[lo_idx, "Low"])
-            span = hi - lo
-            if span > 0:
-                up_swing = swings.index.get_loc(lo_idx) < swings.index.get_loc(hi_idx)
-                levels = ([hi - span*r for r in (0.382, 0.5, 0.618)] if up_swing
-                          else [lo + span*r for r in (0.382, 0.5, 0.618)])
-                tolerance = max((float(a.ATR)*0.35 if pd.notna(a.ATR) else 0),
-                                float(a.Close)*0.0008)
-                nearest = min(levels, key=lambda level: abs(float(a.Close)-level))
-                touched = min(abs(float(a.Low)-nearest), abs(float(a.High)-nearest),
-                              abs(float(a.Close)-nearest)) <= tolerance
-                if up_swing and touched and float(a.Close) > float(a.Open):
-                    fib = 0.70
-                    notes.append(f"Fibonacci: bullish rejection near retracement {nearest:.2f}")
-                elif (not up_swing) and touched and float(a.Close) < float(a.Open):
-                    fib = -0.70
-                    notes.append(f"Fibonacci: bearish rejection near retracement {nearest:.2f}")
-                else:
-                    notes.append("Fibonacci: no confirmed 38.2/50/61.8 retracement rejection")
-        return br, float(np.clip(fib, -1.0, 1.0)), notes
-
-    def _score_percent(score):
-        # 50% = neutral; this is setup-strength, NOT win probability.
-        return round(50.0 + 50.0*float(score), 1)
 
     # -------------------- SIGNAL ENGINE --------------------
     def decide_signal(s3,s5,s15,ml,chain_stats,stale):
@@ -625,7 +560,8 @@ def live_dashboard():
                 return "NO TRADE",prob,["Option-chain PCR is elevated; bearish setup needs caution."]
         reasons.extend([f"3m/5m/15m {direction.lower()} trend aligned.","RSI, MACD and ADX filters passed."])
         return direction,prob,reasons
-        # -------------------- OPTION CHAIN NORMALIZER --------------------
+
+    # -------------------- OPTION CHAIN NORMALIZER --------------------
     def normalize_chain(rows):
         out=[]
         for row in rows or []:
@@ -715,10 +651,13 @@ def live_dashboard():
         oi_score=0.0
         if chain_stats and np.isfinite(chain_stats.get("pcr",np.nan)):
             pcr=chain_stats["pcr"]
-            if pcr>=1.25: oi_score=0.75
-            elif pcr<=0.75: oi_score=-0.75
-            elif pcr>1.05: oi_score=0.35
-            elif pcr<0.95: oi_score=-0.35
+            # Require meaningful OI on both sides; PCR is context, not a standalone trigger.
+            oi_total=float(chain_stats.get("ce_oi",0) or 0)+float(chain_stats.get("pe_oi",0) or 0)
+            if oi_total > 0:
+                if pcr>=1.30: oi_score=0.65
+                elif pcr<=0.70: oi_score=-0.65
+                elif pcr>=1.10: oi_score=0.25
+                elif pcr<=0.90: oi_score=-0.25
         weights={"Trend Following":0.25,"VWAP + Volume":0.20,"Mean Reversion":0.15,
                  "Donchian Breakout":0.15,"Options OI + PCR":0.25}
         scores={"Trend Following":trend,"VWAP + Volume":vwap_score,
@@ -813,8 +752,7 @@ def live_dashboard():
         checks.append(("Bearish volume expansion", pd.notna(x.VOL_RATIO) and x.VOL_RATIO >= 1.2 and x.Close < x.Open))
         notes = [name for name, passed in checks if passed]
         return len(notes), notes
-
-# -------------------- FETCH & PROCESS --------------------
+        # -------------------- FETCH & PROCESS --------------------
     try:
         now=datetime.now(IST)
         from_date=(now.date()-timedelta(days=25)).isoformat()
@@ -837,18 +775,21 @@ def live_dashboard():
             quote_data["ltp"]=stream_ltp
             if stream_cp is not None:
                 quote_data["cp"]=stream_cp
-        d1=indicators(raw.copy())
+        d1=indicators(resample_ohlcv(raw,1))  # completed 1m candles only; avoid intrabar repainting
         d3=indicators(resample_ohlcv(raw,3))
         d5=indicators(resample_ohlcv(raw,5))
         d15=indicators(resample_ohlcv(raw,15))
         if min(len(d1),len(d3),len(d5))<55: st.error("Scalping indicators के लिए पर्याप्त completed 1m/3m/5m candles नहीं हैं."); st.stop()
+        if len(d15) < 55:
+            st.error("15m timeframe में पर्याप्त completed candles नहीं हैं. 15m confirmation के बिना signal रोक दिया गया है.")
+            st.stop()
         s1,s3,s5=map(tf_summary,[d1,d3,d5])
-        s15=tf_summary(d15) if len(d15)>=55 else s5
+        s15=tf_summary(d15)
         latest=raw.index.max()
         now_ts=pd.Timestamp.now(tz="Asia/Kolkata")
         market_open=now_ts.weekday()<5 and (now_ts.hour,now_ts.minute)>=(9,15) and (now_ts.hour,now_ts.minute)<(15,30)
         age=(now_ts-latest).total_seconds()
-        stale=bool(market_open and age>180)
+        stale=bool(market_open and age>120)
         # Option chain
         chain_rows=fetch_option_chain(TOKEN,INDEX_KEY,expiry_choice,int(now.timestamp()//25))
         chain_all=normalize_chain(chain_rows)
@@ -877,13 +818,8 @@ def live_dashboard():
         pa3, pa_notes3, pa_conf3 = price_action_score(d3)
         pa5, pa_notes5, pa_conf5 = price_action_score(d5)
         chart_score = 0.50*pa1 + 0.30*pa3 + 0.20*pa5
-        breakout_score, fibonacci_score, two_strategy_notes = _two_strategy_scores(d1, d5, d15)
-        two_strategy_combined = clamp(0.50*breakout_score + 0.50*fibonacci_score)
-        strategies_agree_call = breakout_score >= 0.20 and fibonacci_score >= 0.20
-        strategies_agree_put = breakout_score <= -0.20 and fibonacci_score <= -0.20
-        # Keep the existing AI/price-action engine, but require the two requested
-        # strategies to independently agree before a CE/PE signal is permitted.
-        final_direction_score = clamp(0.50*chart_score + 0.25*combined_score + 0.25*two_strategy_combined)
+        # Blend chart evidence with the five-strategy ensemble; this is a directional score.
+        final_direction_score = clamp(0.60*chart_score + 0.40*combined_score)
         bullish_votes = sum(v > 0.08 for v in [pa1, pa3, pa5])
         bearish_votes = sum(v < -0.08 for v in [pa1, pa3, pa5])
         total_confirmations = pa_conf1 + pa_conf3 + pa_conf5
@@ -933,14 +869,16 @@ def live_dashboard():
         elif strong_uptrend:
             signal = "NO TRADE"
             reasons = [f"PE blocked: 5m bullish checks {bull5}/5 and 15m bullish checks {bull15}/5. Uptrend filter active; wait for trend reversal."]
-        elif (strategies_agree_call and two_strategy_combined >= 0.20 and final_direction_score >= 0.16 and bullish_votes >= 2 and
-              total_confirmations >= 5 and s1["rsi"] < 82 and ce_trend_ok):
+        elif (final_direction_score >= 0.18 and combined_score >= 0.10 and
+              bullish_votes >= 2 and total_confirmations >= 5 and
+              s1["rsi"] < 78 and ce_trend_ok):
             signal = "BUY CE"
-            reasons = ["Bullish entry confirmed: 1m/3m price action aligned with 5m and 15m trend."]
-        elif (strategies_agree_put and two_strategy_combined <= -0.20 and final_direction_score <= -0.12 and bearish_votes >= 2 and
-              bearish_evidence_total >= 10 and s1["rsi"] > 18 and pe_trend_ok):
+            reasons = ["Bullish entry confirmed: five-strategy ensemble, completed 1m/3m price action and 5m/15m trend are aligned."]
+        elif (final_direction_score <= -0.18 and combined_score <= -0.10 and
+              bearish_votes >= 2 and bearish_evidence_total >= 8 and
+              s1["rsi"] > 22 and pe_trend_ok):
             signal = "BUY PE"
-            reasons = ["Bearish entry confirmed: 1m/3m price action aligned with 5m and 15m trend."]
+            reasons = ["Bearish entry confirmed: five-strategy ensemble, completed 1m/3m price action and 5m/15m trend are aligned."]
         else:
             signal = "NO TRADE"
             reasons = [f"Trend/confirmation conflict: 5m bear/bull {bear5}/{bull5}, 15m bear/bull {bear15}/{bull15}; chart score {final_direction_score:+.2f}. No forced direction."]
@@ -981,11 +919,10 @@ def live_dashboard():
         st.warning(f"WebSocket not connected: {stream_error}. Showing REST quote fallback; live tick feed not confirmed.")
     else:
         st.info("Connecting to Upstox WebSocket… REST quote is shown until the first live tick arrives.")
-    if stale: st.error("STALE FEED: Market open but latest candle is older than 3 minutes. Signal blocked.")
+    if stale: st.error("STALE FEED: Market open but latest candle is older than 2 minutes. Signal blocked.")
     elif not market_open: st.info("Market currently closed or outside regular NSE session. Values show last available exchange data.")
     else: st.success("Market data timestamps are within freshness guard.")
-
-    # -------------------- MULTI-TIMEFRAME --------------------
+        # -------------------- MULTI-TIMEFRAME --------------------
     st.subheader("Multi-Timeframe Regime")
     tf_rows=[]
     for name,s in [("1 min",s1),("3 min",s3),("5 min",s5)]:
@@ -1024,46 +961,22 @@ def live_dashboard():
         e,f=st.columns(2)
         e.metric("Highest CE OI strike",f"{stats['max_ce']:,.0f}")
         f.metric("Highest PE OI strike",f"{stats['max_pe']:,.0f}")
-        view_cols=["Strike","CE LTP","CE OI","CE Prev OI","CE Volume","CE IV","CE Delta","PE LTP","PE OI","PE Prev OI","PE Volume","PE IV","PE Delta"]
-        view=chain[view_cols].copy()
+        view_cols=["Strike","CE LTP","CE Bid","CE Ask","CE OI","CE Volume","CE IV","CE Delta","PE LTP","PE Bid","PE Ask","PE OI","PE Volume","PE IV","PE Delta"]
+        view=chain.reindex(columns=view_cols).copy()
+        for side in ["CE","PE"]:
+            view[f"{side} Spread %"]=np.where(
+                (pd.to_numeric(view[f"{side} Ask"],errors="coerce")>0)&
+                (pd.to_numeric(view[f"{side} Bid"],errors="coerce")>0),
+                (pd.to_numeric(view[f"{side} Ask"],errors="coerce")-pd.to_numeric(view[f"{side} Bid"],errors="coerce"))/
+                pd.to_numeric(view[f"{side} Ask"],errors="coerce")*100,
+                np.nan
+            )
         view["CE OI Chg"]=view["CE OI"]-view["CE Prev OI"]
         view["PE OI Chg"]=view["PE OI"]-view["PE Prev OI"]
-        st.dataframe(view[["Strike","CE LTP","CE OI","CE OI Chg","CE Volume","CE IV","CE Delta",
-                           "PE LTP","PE OI","PE OI Chg","PE Volume","PE IV","PE Delta"]],
+        st.dataframe(view[["Strike","CE LTP","CE Bid","CE Ask","CE Spread %","CE OI","CE OI Chg","CE Volume","CE IV","CE Delta",
+                           "PE LTP","PE Bid","PE Ask","PE Spread %","PE OI","PE OI Chg","PE Volume","PE IV","PE Delta"]],
                      use_container_width=True,hide_index=True)
         st.caption("OI/PCR are context, not standalone buy/sell signals. API values may be delayed or stale outside market hours.")
-
-
-    # -------------------- TWO STRATEGY SCORECARD --------------------
-    st.divider()
-    st.subheader("Two-Strategy Analysis — Separate + Combined")
-    st.caption("ये प्रतिशत setup-strength scores हैं, trade जीतने की statistical probability नहीं. Win probability केवल verified out-of-sample backtest से निकाली जा सकती है.")
-    br_call, br_put = _score_percent(breakout_score), _score_percent(-breakout_score)
-    fib_call, fib_put = _score_percent(fibonacci_score), _score_percent(-fibonacci_score)
-    combo_call, combo_put = _score_percent(two_strategy_combined), _score_percent(-two_strategy_combined)
-    col_a, col_b, col_c = st.columns(3)
-    with col_a:
-        st.markdown("**1) Trend Following + Breakout Retest**")
-        st.metric("CALL setup score", f"{br_call:.1f}%")
-        st.metric("PUT setup score", f"{br_put:.1f}%")
-    with col_b:
-        st.markdown("**2) Fibonacci Retracement**")
-        st.metric("CALL setup score", f"{fib_call:.1f}%")
-        st.metric("PUT setup score", f"{fib_put:.1f}%")
-    with col_c:
-        st.markdown("**3) Combined (50% + 50%)**")
-        st.metric("CALL combined score", f"{combo_call:.1f}%")
-        st.metric("PUT combined score", f"{combo_put:.1f}%")
-        if strategies_agree_call:
-            st.success("Both strategies agree: bullish")
-        elif strategies_agree_put:
-            st.error("Both strategies agree: bearish")
-        else:
-            st.warning("No agreement: prefer NO TRADE")
-    if two_strategy_notes:
-        with st.expander("Strategy reasons"):
-            for item in two_strategy_notes:
-                st.write("• " + item)
 
     # -------------------- FINAL SIGNAL --------------------
     st.divider()
@@ -1075,13 +988,32 @@ def live_dashboard():
     f1.metric("AI confidence score",f"{ai_confidence:.1f}%",help="Heuristic agreement score, not calibrated win probability.")
     f2.metric("Combined strategy score",f"{combined_score:+.3f}",help="Weighted directional score from -1 (bearish) to +1 (bullish).")
     f3.metric("Option selection","CE" if signal=="BUY CE" else "PE" if signal=="BUY PE" else "NONE")
-    st.caption("CE/PE requires agreement from both requested strategies plus existing multi-timeframe, price-action and AI filters. Scores are not calibrated win probabilities.")
+    st.caption("पाँचों strategy के प्रतिशत setup-strength scores हैं, जीतने की probability नहीं. वास्तविक win probability केवल realistic out-of-sample options backtest से निकलेगी.")
     score_rows=[]
     for name,val in strategy_scores.items():
-        score_rows.append({"Strategy":name,"Weight":f"{strategy_weights[name]*100:.0f}%","Directional score":round(val,2),
-                           "Contribution":round(val*strategy_weights[name],3)})
+        score_rows.append({
+            "Strategy":name,
+            "Weight":f"{strategy_weights[name]*100:.0f}%",
+            "Directional score":round(val,2),
+            "CALL setup score":f"{(50+50*val):.1f}%",
+            "PUT setup score":f"{(50-50*val):.1f}%",
+            "Weighted contribution":round(val*strategy_weights[name],3)
+        })
     st.dataframe(pd.DataFrame(score_rows),use_container_width=True,hide_index=True)
+    st.caption("50% = neutral. उदाहरण: CALL setup score 70% का अर्थ 70% win probability नहीं है.")
+
     for r in reasons: st.write("• "+r)
+    with st.expander("Detailed signal diagnostics — why signal / why NO TRADE", expanded=True):
+        st.write(f"**5m trend checks:** Bullish {bull5}/5 · Bearish {bear5}/5")
+        st.write(f"**15m trend checks:** Bullish {bull15}/5 · Bearish {bear15}/5")
+        st.write(f"**Price-action votes:** 1m {pa1:+.2f} · 3m {pa3:+.2f} · 5m {pa5:+.2f}")
+        st.write(f"**Confirmation count:** {total_confirmations} · **Bearish evidence:** {bearish_evidence_total}/24")
+        st.write(f"**Five-strategy score:** {sum(strategy_scores[k]*strategy_weights[k] for k in strategy_weights if k in strategy_scores):+.3f}")
+        st.write(f"**Final directional score:** {final_direction_score:+.3f}")
+        if not ce_trend_ok and not pe_trend_ok:
+            st.write("**Block reason:** 5m/15m trend alignment is not sufficient for either direction.")
+        if not np.isfinite(s1["rsi"]):
+            st.write("**Block reason:** 1m RSI is unavailable.")
     st.caption(f"Bearish confirmation checks: 1m {bear_ev1}/8 · 3m {bear_ev3}/8 · 5m {bear_ev5}/8 · Total {bearish_evidence_total}/24")
     with st.expander("Bearish/PE signal diagnostics"):
         st.write("**1m:** " + (", ".join(bear_notes1) if bear_notes1 else "No bearish checks passed"))
@@ -1096,71 +1028,92 @@ def live_dashboard():
     side_name="CE" if signal=="BUY CE" else "PE" if signal=="BUY PE" else None
     if side_name and not chain.empty:
         key_col=f"{side_name} Key"; ltp_col=f"{side_name} LTP"; vol_col=f"{side_name} Volume"
-        candidates=chain[(chain[ltp_col]>0)&chain[key_col].notna()].copy()
+        oi_col=f"{side_name} OI"; bid_col=f"{side_name} Bid"; ask_col=f"{side_name} Ask"
+        delta_col=f"{side_name} Delta"; iv_col=f"{side_name} IV"
+        candidates=chain[(pd.to_numeric(chain[ltp_col],errors="coerce")>0)&chain[key_col].notna()].copy()
         if not candidates.empty:
+            for col in [ltp_col,vol_col,oi_col,bid_col,ask_col,delta_col,iv_col]:
+                candidates[col]=pd.to_numeric(candidates[col],errors="coerce")
             candidates["atm_dist"]=(candidates.Strike-spot).abs()
-            # Greeks are used internally for contract selection only; no new Greeks
-            # panel or extra Greeks columns are shown in the dashboard.
-            # Delta/IV are preferred filters from the user's reference strategy.
-            # Gamma and Theta are soft ranking inputs because their useful levels
-            # vary with expiry, volatility and time to expiry.
-            delta_col=f"{side_name} Delta"
-            iv_col=f"{side_name} IV"
-            gamma_col=f"{side_name} Gamma"
-            theta_col=f"{side_name} Theta"
-            greeks_available = all(col in candidates.columns for col in
-                                   [delta_col, iv_col, gamma_col, theta_col])
-            if greeks_available:
-                delta_abs=candidates[delta_col].abs()
-                iv_values=candidates[iv_col]
-                valid_greeks=(delta_abs >= 0.30) & (iv_values > 0) & (iv_values < 15)
-                greek_candidates=candidates[valid_greeks].copy()
-                if not greek_candidates.empty:
-                    # Prefer delta near 0.40, lower IV, gamma near the reference
-                    # 0.0012 (soft preference), and lower absolute Theta.
-                    dscore=(1-(greek_candidates[delta_col].abs()-0.40).abs()/0.40).clip(0,1)
-                    ivscore=(1-greek_candidates[iv_col]/15).clip(0,1)
-                    gscore=(1-(greek_candidates[gamma_col]-0.0012).abs()/0.0012).clip(0,1)
-                    theta_abs=greek_candidates[theta_col].abs()
-                    theta_max=theta_abs.max()
-                    tscore=(1-theta_abs/theta_max).clip(0,1) if theta_max > 0 else 1.0
-                    greek_candidates["_greek_rank"]=0.40*dscore+0.25*ivscore+0.20*gscore+0.15*tscore
-                    greek_candidates=greek_candidates.sort_values(
-                        ["_greek_rank","atm_dist",vol_col],ascending=[False,True,False])
-                    candidates=greek_candidates
-                else:
-                    # If no contract meets Delta/IV preferences, retain the
-                    # original ATM/liquidity selection instead of blocking a signal.
-                    candidates=candidates.sort_values(["atm_dist",vol_col],ascending=[True,False])
+            candidates["_spread_pct"]=np.where(
+                (candidates[ask_col]>0)&(candidates[bid_col]>0)&(candidates[ask_col]>=candidates[bid_col]),
+                (candidates[ask_col]-candidates[bid_col])/candidates[ask_col]*100,
+                np.nan
+            )
+            candidates["_quote_ok"]=candidates["_spread_pct"].notna()
+            candidates["_delta_abs"]=candidates[delta_col].abs()
+            # First enforce tradability: volume, OI, delta band and spread.
+            liquid=(candidates[vol_col]>=float(min_option_volume)) & (candidates[oi_col]>=float(min_option_oi))
+            delta_ok=candidates["_delta_abs"].between(float(min_delta),float(max_delta),inclusive="both")
+            quote_rows=candidates[candidates["_quote_ok"]].copy()
+            if not quote_rows.empty:
+                eligible=quote_rows[liquid & delta_ok & (quote_rows["_spread_pct"]<=float(max_spread_pct))].copy()
+                quote_mode="Live bid/ask verified" if bool(eligible.get(f"{side_name} Tick Fresh",pd.Series(False,index=eligible.index)).any()) else "Bid/ask snapshot"
             else:
-                # API may omit Greeks; preserve the original selection fallback.
-                candidates=candidates.sort_values(["atm_dist",vol_col],ascending=[True,False])
-            candidate=candidates.iloc[0].to_dict()
-            ask_candidates = [k for k in candidate.keys() if str(k).lower() in ("ask", "best_ask", "ask_price", "best ask")]
-            bid_candidates = [k for k in candidate.keys() if str(k).lower() in ("bid", "best_bid", "bid_price", "best bid")]
-            ask_value = pd.to_numeric(pd.Series([candidate.get(ask_candidates[0]) if ask_candidates else np.nan]), errors="coerce").iloc[0]
-            bid_value = pd.to_numeric(pd.Series([candidate.get(bid_candidates[0]) if bid_candidates else np.nan]), errors="coerce").iloc[0]
-            option_entry=float(ask_value) if pd.notna(ask_value) and ask_value > 0 else float(candidate[ltp_col])
-            # Short-horizon illustrative premium risk: 20% stop, 1R and 2R targets.
-            option_sl=max(0.05,option_entry*0.80)
-            option_risk=option_entry-option_sl
-            option_t1=option_entry+option_risk
-            option_t2=option_entry+2*option_risk
-            option_rr=(option_t1-option_entry)/option_risk if option_risk>0 else None
-            a,b,c,d,e=st.columns(5)
-            a.metric("Selection",f"BUY {side_name}")
-            b.metric("Strike",f"{candidate['Strike']:.0f}")
-            c.metric("Option premium (Ask preferred, else LTP)",f"₹{option_entry:.2f}")
-            d.metric("Stop Loss",f"₹{option_sl:.2f}")
-            e.metric("T1 / T2",f"₹{option_t1:.2f} / ₹{option_t2:.2f}")
-            st.metric("Risk : Reward",f"1 : {option_rr:.2f}" if option_rr is not None else "N/A")
-            if pd.notna(bid_value) or pd.notna(ask_value):
-                q1,q2=st.columns(2)
-                q1.metric("Option best Bid", f"₹{float(bid_value):.2f}" if pd.notna(bid_value) else "Unavailable")
-                q2.metric("Option best Ask", f"₹{float(ask_value):.2f}" if pd.notna(ask_value) else "Unavailable")
-            st.caption("Option premium is taken from the app's Upstox option-chain/WebSocket feed where available; otherwise the latest available option-chain LTP snapshot. Not an executable order; verify live quote, spread, liquidity, lot size and slippage.")
+                # Do not pretend LTP-only data has an executable spread.
+                eligible=candidates[liquid & delta_ok].copy()
+                quote_mode="LTP only — no two-sided quote"
+            if not eligible.empty:
+                # Normalize ranking inputs so the selection favours usable liquidity,
+                # tight spread, a useful delta and closeness to ATM—not just cheapest premium.
+                eligible["_vol_rank"]=eligible[vol_col].rank(pct=True).fillna(0)
+                eligible["_oi_rank"]=eligible[oi_col].rank(pct=True).fillna(0)
+                eligible["_atm_rank"]=(1-eligible["atm_dist"]/max(float(eligible["atm_dist"].max()),1)).clip(0,1)
+                eligible["_delta_rank"]=(1-(eligible["_delta_abs"]-0.45).abs()/0.45).clip(0,1)
+                if eligible["_quote_ok"].any():
+                    eligible["_spread_rank"]=(1-eligible["_spread_pct"].fillna(float(max_spread_pct))/max(float(max_spread_pct),0.01)).clip(0,1)
+                else:
+                    eligible["_spread_rank"]=0.25
+                eligible["_premium_rank"]=(
+                    0.30*eligible["_delta_rank"]+
+                    0.25*eligible["_spread_rank"]+
+                    0.20*eligible["_vol_rank"]+
+                    0.15*eligible["_oi_rank"]+
+                    0.10*eligible["_atm_rank"]
+                )
+                eligible=eligible.sort_values(["_premium_rank","atm_dist",vol_col],ascending=[False,True,False])
+                candidate=eligible.iloc[0].to_dict()
+                bid=float(candidate[bid_col]) if pd.notna(candidate[bid_col]) and candidate[bid_col]>0 else np.nan
+                ask=float(candidate[ask_col]) if pd.notna(candidate[ask_col]) and candidate[ask_col]>0 else np.nan
+                ltp=float(candidate[ltp_col])
+                option_entry=ask if np.isfinite(ask) else ltp
+                quote_verified=bool(np.isfinite(bid) and np.isfinite(ask) and ask>=bid)
+                spread_pct=float(candidate["_spread_pct"]) if pd.notna(candidate["_spread_pct"]) else np.nan
+                option_sl=max(0.05,option_entry*(1-float(premium_sl_pct)/100))
+                option_risk=option_entry-option_sl
+                option_t1=option_entry+option_risk
+                option_t2=option_entry+2*option_risk
+                option_rr=(option_t1-option_entry)/option_risk if option_risk>0 else None
+                c1,c2,c3,c4,c5=st.columns(5)
+                c1.metric("Selected contract",f"{side_name} {candidate['Strike']:.0f}")
+                c2.metric("Indicative buy price",f"₹{option_entry:.2f}")
+                c3.metric("Best bid / ask",f"₹{bid:.2f} / ₹{ask:.2f}" if quote_verified else "Unavailable")
+                c4.metric("Spread",f"{spread_pct:.2f}%" if np.isfinite(spread_pct) else "N/A")
+                c5.metric("Premium LTP",f"₹{ltp:.2f}")
+                r1,r2,r3,r4=st.columns(4)
+                r1.metric("Premium SL",f"₹{option_sl:.2f}",f"-{premium_sl_pct:.0f}%")
+                r2.metric("Target 1",f"₹{option_t1:.2f}",f"+{option_risk/option_entry*100:.1f}%")
+                r3.metric("Target 2",f"₹{option_t2:.2f}",f"+{2*option_risk/option_entry*100:.1f}%")
+                r4.metric("Risk : Reward",f"1 : {option_rr:.1f}" if option_rr is not None else "N/A")
+                st.write(f"**Premium quality score:** {candidate['_premium_rank']*100:.1f}/100 · **Quote mode:** {quote_mode}")
+                st.write(f"**Liquidity:** Volume {candidate[vol_col]:,.0f} · OI {candidate[oi_col]:,.0f} · **Delta:** {candidate[delta_col]:.3f} · **IV:** {candidate[iv_col]:.2f}")
+                age_col=f"{side_name} Tick Age (s)"
+                tick_age=candidate.get(age_col,np.nan)
+                if pd.notna(tick_age):
+                    st.caption(f"Option WebSocket tick age: {float(tick_age):.1f}s. Tick overlay is considered fresh only up to 10 seconds.")
+                risk_budget=float(capital)*float(risk_pct)/100.0
+                risk_per_unit=option_risk
+                max_units=int(risk_budget/risk_per_unit) if risk_per_unit>0 else 0
+                st.metric("Planned risk budget",f"₹{risk_budget:,.0f}")
+                st.metric("Indicative max units (before lot rounding)",f"{max_units:,}")
+                st.caption(f"Daily stop reference: ₹{float(capital)*float(max_daily_loss_pct)/100:,.0f}. Quantity excludes lot-size rounding, taxes, brokerage, slippage, gaps and partial fills.")
+                if not quote_verified:
+                    st.warning("Two-sided bid/ask quote नहीं मिला. LTP को executable buy price मत मानना; trade लेने से पहले Upstox में live bid/ask verify करना.")
+                st.caption("SL/targets premium percentage पर आधारित illustrative planning levels हैं, live option-premium ATR पर नहीं. ये broker orders नहीं हैं.")
+            else:
+                st.warning("इस signal के लिए चुने गए expiry/strike range में volume, OI, Delta और spread filters पास करने वाला contract नहीं मिला. खराब liquidity वाला option force करके select नहीं किया गया.")
         else:
-            st.warning(f"Signal {side_name} है, लेकिन selected expiry में usable option contract नहीं मिला. Contract unavailable होने पर trade setup confirm नहीं है.")
+            st.warning(f"Signal {side_name} है, लेकिन selected expiry में usable option contract नहीं मिला.")
     elif side_name:
         st.warning("Option chain unavailable: CE/PE signal को contract-confirmed नहीं माना जा सकता; entry/SL/targets withheld.")
     else:
@@ -1212,10 +1165,9 @@ def live_dashboard():
         st.write(f"Signals: **{len(active)}** | Hit ratio: **{wins/len(active)*100:.1f}%** | Mean return per signal: **{active.strategy_ret.mean()*100:.3f}%**")
         st.caption("Signals can overlap and use close-to-close returns; this is a screening study, not a fully costed portfolio backtest.")
     else: st.info("Historical signal sample अभी पर्याप्त नहीं है.")
-
-    # -------------------- CHARTS --------------------
+         # -------------------- CHARTS --------------------
     st.divider()
-    st.subheader("Live NIFTY Charts — 1m / 3m / 5m / 15m")
+    st.subheader("NIFTY Scalping Charts — 1m / 3m / 5m / 15m")
     tab1,tab3,tab5,tab15=st.tabs(["1 Minute","3 Minute","5 Minute","15 Minute"])
     for tab,frame in [(tab1,d1),(tab3,d3),(tab5,d5),(tab15,d15)]:
         with tab:
